@@ -1,0 +1,22 @@
+# Core — always needed
+requests>=2.31.0
+
+# Free web search (default backend, no API key needed)
+duckduckgo-search>=6.0.0
+
+# Page content extraction (used by the fetcher; either works, trafilatura is preferred)
+trafilatura>=1.8.0
+beautifulsoup4>=4.12.0
+
+# --- Optional, only needed if you use these backends ---
+# Tavily search (optional upgrade over DuckDuckGo, needs a free API key): SEARCH_BACKEND=tavily
+#   (no extra package needed — called via `requests`)
+# Google Gemini (free tier): LLM_BACKEND=gemini
+#   (no extra package needed — called via `requests`)
+# Groq (free tier): LLM_BACKEND=groq
+#   (no extra package needed — called via `requests`)
+# Ollama (fully local): LLM_BACKEND=ollama
+#   (no extra package needed — called via `requests`; install Ollama itself separately: https://ollama.com)
+
+# Anthropic Claude — optional, paid, not required. Only install if you set LLM_BACKEND=claude.
+# anthropic>=0.40.0
