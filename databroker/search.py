@@ -24,17 +24,37 @@ class SearchProvider(ABC):
 
 class DuckDuckGoSearch(SearchProvider):
     def search(self, query: str, max_results: int = 5) -> list[dict]:
-        from duckduckgo_search import DDGS  # pip install duckduckgo-search
+        try:
+            from ddgs import DDGS  # pip install ddgs (renamed from duckduckgo-search in 2026)
+        except ImportError:
+            from duckduckgo_search import DDGS  # fallback for older installs
 
         results = []
         try:
             with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_results):
-                    results.append({
-                        "title": r.get("title", ""),
-                        "url": r.get("href", ""),
-                        "snippet": r.get("body", ""),
-                    })
+                # Try the dedicated news index first — for "what's new/changed"
+                # style research questions this returns actual recent articles
+                # with real dates, instead of evergreen homepage/wiki pages that
+                # the general web index tends to rank highest for a bare company
+                # name query.
+                try:
+                    for r in ddgs.news(query, max_results=max_results):
+                        results.append({
+                            "title": r.get("title", ""),
+                            "url": r.get("url") or r.get("href", ""),
+                            "snippet": r.get("body", ""),
+                            "publication_date": (r.get("date") or "")[:10] or None,
+                        })
+                except Exception:
+                    pass  # news index can be flakier/rate-limited than text search
+
+                if not results:
+                    for r in ddgs.text(query, max_results=max_results):
+                        results.append({
+                            "title": r.get("title", ""),
+                            "url": r.get("href", ""),
+                            "snippet": r.get("body", ""),
+                        })
         except Exception:
             # Network hiccups / rate limiting shouldn't crash the whole research run —
             # the agent just treats this sub-question as having no evidence this round.

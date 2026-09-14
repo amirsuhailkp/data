@@ -11,6 +11,7 @@ import json
 import datetime
 from contextlib import contextmanager
 from pathlib import Path
+from .graph import normalize_entity_name, normalize_predicate
 
 DEFAULT_DB_PATH = Path.home() / ".databroker" / "databroker.db"
 
@@ -101,11 +102,33 @@ CREATE TABLE IF NOT EXISTS research_sessions (
     result_summary TEXT,
     created_at TEXT NOT NULL
 );
+
+-- Phase 5: knowledge graph. A lightweight property graph on top of SQLite —
+-- entities (companies, people, products, regulators, etc.) and directed
+-- relationships between them, each traceable back to the claim it came from.
+CREATE TABLE IF NOT EXISTS entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,                    -- canonical display name (first form seen)
+    normalized_name TEXT NOT NULL UNIQUE,  -- dedup key, see graph.py
+    entity_type TEXT,                      -- company | person | product | regulator | other
+    company_id INTEGER REFERENCES companies(id),  -- set if this entity IS a tracked company
+    first_seen_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_entity_id INTEGER NOT NULL REFERENCES entities(id),
+    predicate TEXT NOT NULL,               -- e.g. acquired, partnered_with, invested_in, competitor_of
+    object_entity_id INTEGER NOT NULL REFERENCES entities(id),
+    claim_id INTEGER REFERENCES claims(id),  -- provenance
+    confidence TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 
 def now() -> str:
-    return datetime.datetime.utcnow().isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 class DB:
@@ -237,7 +260,7 @@ class DB:
 
     # ---- events (change detection + importance) ----
     def recent_events(self, company_id: int, days: int = 60):
-        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+        cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
         with self.cursor() as cur:
             cur.execute(
                 "SELECT * FROM events WHERE company_id=? AND last_updated_at >= ? ORDER BY last_updated_at DESC",
@@ -295,5 +318,93 @@ class DB:
             cur.execute(
                 "SELECT * FROM research_sessions WHERE company_id=? ORDER BY created_at DESC LIMIT ?",
                 (company_id, limit),
+            )
+            return cur.fetchall()
+
+    # ---- knowledge graph (Phase 5) ----
+    def upsert_entity(self, name: str, entity_type: str | None = None) -> int:
+        """Returns the entity id, creating it if a matching normalized_name
+        doesn't already exist. If this name matches a tracked company's name,
+        links the entity to that company_id — that's what makes "NVIDIA" as
+        mentioned inside some other company's claim resolve back to your
+        actual watchlist entry for NVDA, enabling cross-company queries."""
+        norm = normalize_entity_name(name)
+        with self.cursor() as cur:
+            cur.execute("SELECT id, company_id FROM entities WHERE normalized_name=?", (norm,))
+            existing = cur.fetchone()
+            if existing:
+                if existing["company_id"] is None:
+                    # A company may have been added to `companies` after this
+                    # entity was first seen — check again on every upsert.
+                    company_id = self._match_company_id(cur, norm)
+                    if company_id is not None:
+                        cur.execute("UPDATE entities SET company_id=? WHERE id=?", (company_id, existing["id"]))
+                return existing["id"]
+
+            company_id = self._match_company_id(cur, norm)
+            cur.execute(
+                "INSERT INTO entities (name, normalized_name, entity_type, company_id, first_seen_at) "
+                "VALUES (?,?,?,?,?)",
+                (name, norm, entity_type, company_id, now()),
+            )
+            return cur.lastrowid
+
+    @staticmethod
+    def _match_company_id(cur, normalized_entity_name: str):
+        cur.execute("SELECT id, name FROM companies")
+        for row in cur.fetchall():
+            if normalize_entity_name(row["name"]) == normalized_entity_name:
+                return row["id"]
+        return None
+
+    def add_relationship(self, subject_entity_id: int, predicate: str, object_entity_id: int,
+                          claim_id: int | None, confidence: str | None = None) -> int:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO relationships (subject_entity_id, predicate, object_entity_id, "
+                "claim_id, confidence, created_at) VALUES (?,?,?,?,?,?)",
+                (subject_entity_id, normalize_predicate(predicate), object_entity_id, claim_id, confidence, now()),
+            )
+            return cur.lastrowid
+
+    def get_relationships_for_entity(self, entity_id: int):
+        """All relationships where this entity is either the subject or the object."""
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT r.*, s.name AS subject_name, o.name AS object_name
+                   FROM relationships r
+                   JOIN entities s ON s.id = r.subject_entity_id
+                   JOIN entities o ON o.id = r.object_entity_id
+                   WHERE r.subject_entity_id=? OR r.object_entity_id=?
+                   ORDER BY r.created_at DESC""",
+                (entity_id, entity_id),
+            )
+            return cur.fetchall()
+
+    def get_entity_by_company(self, company_id: int):
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM entities WHERE company_id=?", (company_id,))
+            return cur.fetchone()
+
+    def find_cross_watchlist_connections(self):
+        """Relationships where BOTH sides are entities linked to a company on
+        the watchlist — e.g. 'NVIDIA acquired Hugging Face' surfacing here if
+        both NVIDIA and Hugging Face happen to be tracked companies. This is
+        the concrete payoff of the graph: a connection between two portfolio
+        holdings that would otherwise be buried in two separate reports."""
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT r.*, s.name AS subject_name, o.name AS object_name,
+                          sc.ticker AS subject_ticker, oc.ticker AS object_ticker
+                   FROM relationships r
+                   JOIN entities s ON s.id = r.subject_entity_id
+                   JOIN entities o ON o.id = r.object_entity_id
+                   JOIN companies sc ON sc.id = s.company_id
+                   JOIN companies oc ON oc.id = o.company_id
+                   JOIN watchlist ws ON ws.company_id = sc.id
+                   JOIN watchlist wo ON wo.company_id = oc.id
+                   WHERE s.company_id IS NOT NULL AND o.company_id IS NOT NULL
+                     AND s.company_id != o.company_id
+                   ORDER BY r.created_at DESC"""
             )
             return cur.fetchall()

@@ -17,18 +17,47 @@ import sys
 from .db import DB
 from .llm import build_provider_from_env
 from .search import build_search_from_env
-from .social import build_social_from_env
+from .social import build_social_from_env, build_financial_from_env
 from .fetcher import PageFetcher
 from .agent import ResearchAgent
 
 
-def build_agent(db: DB) -> ResearchAgent:
+def _load_dotenv():
+    """Optional .env support so config (LLM_BACKEND, GROQ_API_KEY, etc.) persists
+    across terminal sessions instead of needing `$env:X="Y"` / `export X=Y` retyped
+    every time. Looks for a .env file in the current directory. Silently does
+    nothing if python-dotenv isn't installed or no .env file exists — this is a
+    convenience, not a requirement."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+
+def build_fetcher(llm):
+    """FETCHER_BACKEND=static (default) | browser. Browser mode needs
+    `pip install playwright && playwright install chromium` — falls back to
+    static automatically if Playwright isn't actually installed, so this is
+    safe to leave on `browser` even before you've set that up."""
+    import os
+    if os.environ.get("FETCHER_BACKEND", "static").lower() == "browser":
+        from .browser import BrowserFetcher, NavigationAgent
+        return BrowserFetcher(navigator=NavigationAgent(llm))
+    return PageFetcher()
+
+
+def build_agent(db: DB, announce: bool = True) -> ResearchAgent:
+    llm = build_provider_from_env()
+    if announce:
+        print(f"[databroker] Using LLM provider: {llm.describe()}", file=sys.stderr)
     return ResearchAgent(
         db=db,
-        llm=build_provider_from_env(),
+        llm=llm,
         search=build_search_from_env(),
-        fetcher=PageFetcher(),
+        fetcher=build_fetcher(llm),
         social=build_social_from_env(),
+        financial=build_financial_from_env(),
     )
 
 
@@ -64,6 +93,18 @@ def build_parser():
 
     events = sub.add_parser("events", help="List recorded events for a company")
     events.add_argument("ticker")
+
+    graph = sub.add_parser(
+        "graph",
+        help="Show the knowledge graph — entities and relationships discovered for a company",
+    )
+    graph.add_argument("ticker")
+
+    sub.add_parser(
+        "connections",
+        help="Show relationships that connect two or more of your watchlist companies "
+             "(e.g. one acquired another, one is a supplier to another)",
+    )
 
     sweep = sub.add_parser(
         "sweep",
@@ -181,6 +222,38 @@ def cmd_events(db: DB, args):
               f"(status={r['status']}, thesis_impact={r['thesis_impact']})")
 
 
+def cmd_graph(db: DB, args):
+    company = db.get_company(args.ticker)
+    if not company:
+        print(f"Unknown ticker {args.ticker}.")
+        sys.exit(1)
+    entity = db.get_entity_by_company(company["id"])
+    if not entity:
+        print(f"No graph entity for {args.ticker} yet — run `research` a few times first "
+              "(entities/relationships are extracted alongside regular research, not separately).")
+        return
+    rels = db.get_relationships_for_entity(entity["id"])
+    if not rels:
+        print(f"No relationships recorded for {company['name']} yet.")
+        return
+    print(f"Knowledge graph for {company['name']} ({args.ticker.upper()}):\n")
+    for r in rels:
+        arrow = f"{r['subject_name']} --[{r['predicate']}]--> {r['object_name']}"
+        print(f"  {arrow}  (confidence={r['confidence']})")
+
+
+def cmd_connections(db: DB, args):
+    rows = db.find_cross_watchlist_connections()
+    if not rows:
+        print("No relationships connecting two or more watchlist companies found yet — "
+              "run `research`/`sweep` on your watchlist a few times first.")
+        return
+    print("Connections across your watchlist:\n")
+    for r in rows:
+        print(f"  {r['subject_name']} ({r['subject_ticker']}) --[{r['predicate']}]--> "
+              f"{r['object_name']} ({r['object_ticker']})")
+
+
 def cmd_doctor(db: DB, args):
     import os
     from .llm import OllamaProvider
@@ -191,6 +264,25 @@ def cmd_doctor(db: DB, args):
     print("GEMINI_API_KEY  =", "set" if os.environ.get("GEMINI_API_KEY") else "not set")
     print("SEARCH_BACKEND  =", os.environ.get("SEARCH_BACKEND", "duckduckgo (default)"))
     print("SOCIAL_BACKEND  =", os.environ.get("SOCIAL_BACKEND", "off (default)"))
+    if os.environ.get("SOCIAL_BACKEND", "off").lower() in ("reddit", "both"):
+        from .reddit_client import parse_credentials_from_env
+        creds = parse_credentials_from_env()
+        if creds:
+            print(f"  Reddit auth   = OAuth, {len(creds)} credential(s) pooled "
+                  f"(~{len(creds) * 95} req/min combined budget)")
+        else:
+            print("  Reddit auth   = none configured — using unauthenticated public search "
+                  "(lower, less predictable rate limit). Set REDDIT_CLIENT_ID(_N)/"
+                  "REDDIT_CLIENT_SECRET(_N) to use the OAuth pool instead.")
+    print("FINANCIAL_BACKEND =", os.environ.get("FINANCIAL_BACKEND", "off (default)"))
+    print("FETCHER_BACKEND =", os.environ.get("FETCHER_BACKEND", "static (default)"))
+    if os.environ.get("FETCHER_BACKEND", "static").lower() == "browser":
+        try:
+            import playwright  # noqa: F401
+            print("Playwright       = installed")
+        except ImportError:
+            print("Playwright       = NOT installed — will silently fall back to static fetch. "
+                  "Run: pip install playwright && playwright install chromium")
     provider = build_provider_from_env()
     print("\n-> Resolved LLM provider:", type(provider).__name__)
 
@@ -231,6 +323,7 @@ def cmd_watch_loop(db: DB, args):
 
 
 def main(argv=None):
+    _load_dotenv()
     parser = build_parser()
     args = parser.parse_args(argv)
     db = DB()
@@ -243,6 +336,8 @@ def main(argv=None):
         "ask": cmd_ask,
         "digest": cmd_digest,
         "events": cmd_events,
+        "graph": cmd_graph,
+        "connections": cmd_connections,
         "doctor": cmd_doctor,
         "sweep": cmd_sweep,
         "watch-loop": cmd_watch_loop,

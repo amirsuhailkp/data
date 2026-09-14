@@ -34,6 +34,12 @@ class LLMProvider(ABC):
         """Ask the model for a single JSON object matching schema_hint. No web access —
         anything the model needs to reason over must already be in `prompt`."""
 
+    def describe(self) -> str:
+        """Human-readable summary of what's actually configured — shown by the CLI
+        before any LLM call is made, so a wrong-backend mistake (see OllamaProvider's
+        404 case) is visible immediately instead of discovered via a stack trace."""
+        return type(self).__name__
+
 
 def _extract_json(text: str) -> dict:
     text = text.strip()
@@ -76,23 +82,39 @@ class OllamaProvider(LLMProvider):
 
     def complete_json(self, system: str, prompt: str, schema_hint: str, task: str = "general") -> dict:
         full_prompt = _build_prompt(prompt, schema_hint)
-        resp = requests.post(
-            f"{self.base_url}/api/chat",
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": full_prompt},
-                ],
-                "format": "json",   # Ollama enforces valid JSON output when supported by the model
-                "stream": False,
-                "options": {"temperature": 0.2},
-            },
-            timeout=180,
-        )
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": full_prompt},
+                    ],
+                    "format": "json",   # Ollama enforces valid JSON output when supported by the model
+                    "stream": False,
+                    "options": {"temperature": 0.2},
+                },
+                timeout=180,
+            )
+        except requests.ConnectionError as e:
+            raise RuntimeError(
+                f"Could not reach Ollama at {self.base_url}. Is `ollama serve` running? "
+                f"(underlying error: {e})"
+            ) from e
+
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Ollama returned 404 for model '{self.model}' — it likely isn't pulled yet. "
+                f"Run `ollama pull {self.model}` (or set OLLAMA_MODEL to a model you already "
+                f"have — see `ollama list` for what's installed)."
+            )
         resp.raise_for_status()
         content = resp.json().get("message", {}).get("content", "")
         return _extract_json(content)
+
+    def describe(self) -> str:
+        return f"Ollama ({self.model} @ {self.base_url})"
 
     @staticmethod
     def is_available(base_url: str | None = None) -> bool:
@@ -109,7 +131,14 @@ class OllamaProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 class GroqProvider(LLMProvider):
     def __init__(self, model: str | None = None, api_key: str | None = None):
-        self.model = model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        # llama-3.3-70b-versatile and llama-3.1-8b-instant were deprecated by
+        # Groq for free/dev-tier accounts (announced June 2026, shut down
+        # August 16, 2026). openai/gpt-oss-120b is Groq's recommended
+        # replacement for general reasoning quality; openai/gpt-oss-20b is the
+        # lighter/faster replacement for high-volume repetitive calls. Check
+        # https://console.groq.com/docs/models for the current lineup if
+        # this ever 400s on you — Groq's free-tier catalog turns over often.
+        self.model = model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
         self.api_key = api_key or os.environ.get("GROQ_API_KEY")
         if not self.api_key:
             raise RuntimeError("GROQ_API_KEY not set. Get a free key at https://console.groq.com")
@@ -130,9 +159,19 @@ class GroqProvider(LLMProvider):
             },
             timeout=60,
         )
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Groq returned 404 for model '{self.model}' — it's likely been deprecated/renamed. "
+                f"Check https://console.groq.com/docs/models for the current lineup and set GROQ_MODEL."
+            )
+        if resp.status_code == 401:
+            raise RuntimeError("Groq returned 401 Unauthorized — check GROQ_API_KEY is set correctly.")
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
         return _extract_json(content)
+
+    def describe(self) -> str:
+        return f"Groq ({self.model})"
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +179,11 @@ class GroqProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 class GeminiProvider(LLMProvider):
     def __init__(self, model: str | None = None, api_key: str | None = None):
-        self.model = model or os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+        # Pro models were removed from Gemini's free tier in ~April 2026 — the
+        # free tier is Flash-only now. gemini-2.5-flash is the current safe
+        # default; check https://ai.google.dev/gemini-api/docs/models for
+        # whatever's newest (Gemini's free-tier lineup moves fast too).
+        self.model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY not set. Get a free key at https://aistudio.google.com/apikey")
@@ -165,6 +208,9 @@ class GeminiProvider(LLMProvider):
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         return _extract_json(text)
 
+    def describe(self) -> str:
+        return f"Gemini ({self.model})"
+
 
 # ---------------------------------------------------------------------------
 # Optional / paid — kept for anyone who wants to switch back later.
@@ -188,6 +234,9 @@ class ClaudeProvider(LLMProvider):
         text = "\n".join(b.text for b in response.content if getattr(b, "type", None) == "text")
         return _extract_json(text)
 
+    def describe(self) -> str:
+        return f"Claude ({self.model}) — paid"
+
 
 # ---------------------------------------------------------------------------
 # Offline testing provider
@@ -196,6 +245,9 @@ class MockProvider(LLMProvider):
     def complete_json(self, system: str, prompt: str, schema_hint: str, task: str = "general") -> dict:
         return {"mock": True, "task": task, "note": "MockProvider: no reasoning performed.",
                 "prompt_preview": prompt[:120]}
+
+    def describe(self) -> str:
+        return "Mock (no real LLM — offline testing only)"
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +270,10 @@ class HybridProvider(LLMProvider):
     def complete_json(self, system: str, prompt: str, schema_hint: str, task: str = "general") -> dict:
         provider = self.overrides.get(task, self.default)
         return provider.complete_json(system, prompt, schema_hint, task)
+
+    def describe(self) -> str:
+        overrides_str = ", ".join(f"{t}->{p.describe()}" for t, p in self.overrides.items())
+        return f"Hybrid (default: {self.default.describe()}" + (f"; {overrides_str}" if overrides_str else "") + ")"
 
 
 # ---------------------------------------------------------------------------
@@ -267,4 +323,15 @@ def build_provider_from_env() -> LLMProvider:
         return local or cloud or MockProvider()
 
     # auto
-    return try_ollama() or try_groq() or try_gemini() or MockProvider()
+    local = try_ollama()
+    cloud_groq = try_groq()
+    cloud_gemini = try_gemini()
+    if local and (cloud_groq or cloud_gemini):
+        import sys
+        print(
+            "[databroker] LLM_BACKEND=auto: Ollama is running locally AND a cloud API key is set — "
+            "defaulting to local Ollama. If you meant to use Groq/Gemini instead, set LLM_BACKEND "
+            "explicitly (e.g. LLM_BACKEND=groq) rather than relying on auto-detection.",
+            file=sys.stderr,
+        )
+    return local or cloud_groq or cloud_gemini or MockProvider()

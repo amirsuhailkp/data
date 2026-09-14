@@ -61,7 +61,7 @@ def sweep_once(db: DB, agent: ResearchAgent, delay_seconds: float = 3.0) -> Swee
     account with a long watchlist. Set to 0 for local-only (Ollama) setups
     where there's no external rate limit to worry about.
     """
-    started = datetime.datetime.utcnow().isoformat()
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     per_company = []
 
     watchlist = db.list_watchlist()
@@ -79,7 +79,7 @@ def sweep_once(db: DB, agent: ResearchAgent, delay_seconds: float = 3.0) -> Swee
             time.sleep(delay_seconds)
 
     digest = agent.daily_digest()
-    finished = datetime.datetime.utcnow().isoformat()
+    finished = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return SweepSummary(started_at=started, finished_at=finished, per_company=per_company, digest=digest)
 
 

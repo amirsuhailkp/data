@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from .db import DB
 from .llm import LLMProvider
 from .search import SearchProvider, MockSearch
-from .social import SocialProvider
+from .social import SocialProvider, FinancialProvider
 from .fetcher import PageFetcher, MockFetcher
 from . import heuristics
 
@@ -58,6 +58,7 @@ MAX_SEARCH_HITS_PER_QUESTION = int(os.environ.get("MAX_SEARCH_HITS_PER_QUESTION"
 MAX_FETCH_CHARS = int(os.environ.get("MAX_FETCH_CHARS", "1500"))
 MAX_SUBQUESTIONS = int(os.environ.get("RESEARCH_MAX_SUBQUESTIONS", "6"))
 MAX_SOCIAL_HITS_PER_QUESTION = int(os.environ.get("MAX_SOCIAL_HITS_PER_QUESTION", "3"))
+MAX_FINANCIAL_HITS = int(os.environ.get("MAX_FINANCIAL_HITS", "5"))
 
 
 @dataclass
@@ -73,12 +74,14 @@ class ResearchResult:
 
 class ResearchAgent:
     def __init__(self, db: DB, llm: LLMProvider, search: SearchProvider | None = None,
-                 fetcher: PageFetcher | None = None, social: SocialProvider | None = None):
+                 fetcher: PageFetcher | None = None, social: SocialProvider | None = None,
+                 financial: FinancialProvider | None = None):
         self.db = db
         self.llm = llm
         self.search = search or MockSearch()
         self.fetcher = fetcher or MockFetcher()
         self.social = social  # None = Phase 4 social intelligence disabled (the default)
+        self.financial = financial  # None = financial/trading platforms disabled (the default)
         self._call_count = 0
 
     def _call(self, task: str, prompt: str, schema_hint: str) -> dict:
@@ -112,7 +115,12 @@ class ResearchAgent:
         return heuristics.build_search_queries(company_name, ticker, sub_question)
 
     # ---------- Step 3: retrieve + extract structured claims (the one step that must read text) ----------
-    def gather_evidence(self, sub_question: str, company_name: str, ticker: str) -> list[dict]:
+    def gather_evidence(self, sub_question: str, company_name: str, ticker: str,
+                         extra_hits: list[dict] | None = None) -> list[dict]:
+        """`extra_hits` is pre-fetched "first line" content (currently: ticker-keyed
+        financial/trading platform activity — see investigate()) that gets merged
+        in ahead of general web search results, rather than fetched fresh per
+        sub-question the way social search hits are."""
         queries = self.plan_search_queries(sub_question, company_name, ticker)
 
         hits = []
@@ -137,14 +145,35 @@ class ResearchAgent:
                     seen_urls.add(url)
                     social_hits.append(h)
 
-        if not hits and not social_hits:
+        financial_hits = []
+        for h in (extra_hits or []):
+            url = h.get("url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                financial_hits.append(h)
+
+        if not hits and not social_hits and not financial_hits:
             return []
 
-        hit_lookup = {h["url"]: h for h in hits + social_hits}
+        hit_lookup = {h["url"]: h for h in hits + social_hits + financial_hits}
 
         context_blocks = []
+        # Financial/trading platform chatter goes first — "first line of
+        # information" is reflected in prompt ordering, not just in being
+        # included at all.
+        for h in financial_hits:
+            content = h.get("snippet", "")
+            if not content:
+                continue
+            context_blocks.append(
+                "[TRADING PLATFORM CHATTER — real-time trader sentiment, not verified fact; "
+                "only extract a claim from this if it describes something concrete (e.g. a "
+                "specific event being discussed), and keep confidence low unless corroborated "
+                f"elsewhere in this content]\nURL: {h['url']}\nTitle: {h.get('title', '')}\n"
+                f"Content: {content[:MAX_FETCH_CHARS]}"
+            )
         for h in hits[:MAX_SEARCH_HITS_PER_QUESTION]:
-            page_text = self.fetcher.fetch(h["url"], max_chars=MAX_FETCH_CHARS)
+            page_text = self.fetcher.fetch(h["url"], max_chars=MAX_FETCH_CHARS, sub_question=sub_question)
             content = page_text or h.get("snippet", "")
             if not content:
                 continue
@@ -177,13 +206,18 @@ class ResearchAgent:
                 "Extract only claims directly supported by the content above. Copy source_url "
                 "EXACTLY from one of the URLs given above — never invent or modify a URL. If "
                 "nothing above actually answers the question, return an empty claims list "
-                "rather than guessing."
+                "rather than guessing. For each claim, also note any named entities (other "
+                "companies, people, products, regulators) it involves and any explicit "
+                "relationship between them (e.g. 'acquired', 'partnered_with', 'invested_in', "
+                "'competitor_of', 'ceo_of', 'sued') — skip this if the claim doesn't clearly "
+                "state a relationship between two named things."
             ),
             schema_hint=(
                 '{"claims": [{"text": "...", "source_url": "...", '
                 '"source_type": "filing|regulatory|investor_relations|primary_statement|'
                 'news|industry_pub|community|social", "publication_date": "YYYY-MM-DD or null", '
-                '"confidence": "low|medium|high"}]}'
+                '"confidence": "low|medium|high", '
+                '"relationships": [{"subject": "...", "predicate": "...", "object": "..."}]}]}'
             ),
         )
         claims = result.get("claims", [])
@@ -231,6 +265,19 @@ class ResearchAgent:
             stored_ids.append(claim_id)
             key = heuristics.normalize(c["text"])[:60]
             groups.setdefault(key, []).append(claim_id)
+
+            # Phase 5: knowledge graph — store any relationships this claim
+            # mentioned (from the same extraction call, no extra LLM cost).
+            # Entity resolution (matching "NVIDIA" / "NVIDIA Corp." / etc. to
+            # one entity, and linking it to a tracked company if applicable)
+            # is entirely deterministic — see graph.py / db.upsert_entity.
+            for rel in c.get("relationships", []) or []:
+                subject, predicate, obj = rel.get("subject"), rel.get("predicate"), rel.get("object")
+                if not subject or not predicate or not obj:
+                    continue
+                subject_id = self.db.upsert_entity(subject)
+                object_id = self.db.upsert_entity(obj)
+                self.db.add_relationship(subject_id, predicate, object_id, claim_id, c.get("confidence"))
 
         for key, ids in groups.items():
             if len(ids) >= 2:
@@ -366,8 +413,21 @@ class ResearchAgent:
 
         result = ResearchResult(objective=objective, plan=plan)
 
-        for sub_q in plan:
-            claims = self.gather_evidence(sub_q, company_name, ticker)
+        # Financial/trading platform activity (StockTwits etc.) is ticker-scoped,
+        # not free-text searchable — fetch it once per research session rather
+        # than once per sub-question, and feed it into only the first (highest-
+        # priority, per plan_research's ordering) sub-question's extraction.
+        # Repeating identical trader chatter across every sub-question's prompt
+        # would cost tokens without adding information.
+        financial_hits = []
+        if self.financial is not None:
+            financial_hits = self.financial.get_ticker_activity(ticker, max_results=MAX_FINANCIAL_HITS)
+
+        for i, sub_q in enumerate(plan):
+            claims = self.gather_evidence(
+                sub_q, company_name, ticker,
+                extra_hits=financial_hits if i == 0 else None,
+            )
             if not claims:
                 continue
             claim_ids, conflicts = self.cross_check_and_store(company_id, claims)
