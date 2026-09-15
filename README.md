@@ -121,7 +121,7 @@ Run `python -m databroker.cli doctor` any time to see which backend is active.
 | §23 Daily Intelligence Brief | ✅ `digest` — pure DB read, zero LLM calls |
 | §26 Boundary: research, not trading | ✅ enforced in the system prompt |
 | Scheduled/background monitoring (Phase 2) | ✅ `sweep` (cron-friendly one-shot) and `watch-loop` (long-running, stdlib-only, no new dependency) |
-| §5 Social & Community Intelligence (Phase 4) | ✅ opt-in (`SOCIAL_BACKEND`) — Reddit (OAuth pool, multi-app throughput) + Hacker News, plus opt-in `FINANCIAL_BACKEND` for StockTwits as a "first line" ticker-scoped source — see below |
+| §5 Social & Community Intelligence (Phase 4) | ✅ opt-in (`SOCIAL_BACKEND`) — Reddit (OAuth pool, multi-app throughput) + Hacker News, plus opt-in `FINANCIAL_BACKEND` for SEC EDGAR filings + Finnhub news + StockTwits as "first line" ticker-scoped sources — see below |
 | §18 Full browser agent (dynamic navigation) | ✅ opt-in (`FETCHER_BACKEND=browser`) — JS rendering + one bounded, mostly-deterministic navigation hop past index/listing pages — see below |
 | Knowledge graph (Phase 5) | ✅ lightweight property graph on SQLite — entities/relationships extracted alongside regular research, zero extra LLM calls — see below |
 
@@ -192,32 +192,59 @@ a different trust category than a filing or a news article:
 
 ## Real-time financial/trading platforms ("first line" sources)
 
-Off by default — turn it on with `FINANCIAL_BACKEND=stocktwits`.
+Off by default — turn it on with `FINANCIAL_BACKEND=<comma-separated list>`,
+e.g. `FINANCIAL_BACKEND=sec,finnhub,stocktwits` to combine all three, or
+just `FINANCIAL_BACKEND=sec` for the free, no-key option on its own.
 
-Unlike Reddit/HN (free-text searchable), platforms like StockTwits are
-inherently ticker-scoped — a stream of trader chatter about one specific
-symbol, not something you query with arbitrary text. That difference is
-reflected in how this is wired in (`social.py`'s `FinancialProvider`
-interface and `agent.py`'s `investigate()`):
+| Backend | What it is | Cost | Source type / reliability tier |
+|---|---|---|---|
+| `sec` | Official SEC EDGAR filings (8-K, 10-K, 10-Q, S-1, proxy statements, 13D/G, etc.) via `data.sec.gov` | Free, no API key | `filing`, tier **1** — the single highest-reliability source this tool has |
+| `finnhub` | Finnhub's company-news wire (`company-news` endpoint) | Free tier (~60 calls/min), needs `FINNHUB_API_KEY` from finnhub.io | `news`, tier 5 — same tier as general web news |
+| `stocktwits` | StockTwits' public symbol stream — real trader chatter/sentiment | Free, no key (historically) | `community`, tier 7 — sentiment/discussion, not verified fact |
+
+Unlike Reddit/HN (free-text searchable), these are all inherently
+ticker-scoped — activity about one specific symbol, not something you query
+with arbitrary text. That's reflected in how they're wired in (`social.py`'s
+`FinancialProvider` interface and `agent.py`'s `investigate()`):
 
 - Fetched **once per research session**, not once per sub-question —
-  repeating identical trader chatter across every sub-question's extraction
-  prompt would cost tokens without adding information.
+  repeating identical content across every sub-question's extraction prompt
+  would cost tokens without adding information.
 - Merged into the **first (highest-priority) sub-question's** extraction
   context, and placed **first** in that prompt — "first line of information"
-  is reflected in actual prompt ordering, not just in being included.
-- Tagged and framed as `[TRADING PLATFORM CHATTER]`, with the same
-  source-type-override and no-auto-confirm-on-serious-keywords treatment as
-  Reddit/HN content above — confirmed by testing a claim that mentioned
-  "acquisition" sourced from StockTwits: it correctly escalated to a real
-  LLM importance check rather than auto-confirming, and did so even with no
-  thesis on file, exactly like the equivalent Reddit case.
+  is reflected in actual prompt ordering, not just in being included. With
+  more than one backend enabled, `CombinedFinancialProvider` splits the
+  per-session hit budget (`MAX_FINANCIAL_HITS`, default 5) evenly across
+  them, since a filing, a news wire, and trader chatter are genuinely
+  different information — not redundant copies competing for the same slot.
+- Each source carries its own framing label in the extraction prompt —
+  `[OFFICIAL SEC FILING]`, `[FINANCIAL NEWS WIRE]`, or
+  `[TRADING PLATFORM CHATTER]` — and its `source_type` is trusted from the
+  provider rather than re-guessed by the LLM, exactly like Reddit/HN above.
+  A claim sourced from StockTwits or Reddit that mentions something serious
+  (e.g. "acquisition") still gets the same no-auto-confirm-on-serious-
+  keywords escalation to a real LLM check, regardless of whether a thesis
+  is on file — confirmed by testing.
 
-`STOCKTWITS`'s public symbol-stream endpoint has historically required no
-API key for basic reads, but financial data APIs tend to tighten terms over
-time — this fails soft (returns no results) rather than erroring if that
-ever changes, and `MAX_FINANCIAL_HITS` (default 5) controls how much of it
-gets pulled in per session.
+**Setup notes:**
+- `sec` needs no key, but SEC's fair-access policy asks for a real contact
+  string in the User-Agent — set `SEC_EDGAR_CONTACT` (e.g. an email) in
+  `.env`. It'll still run without it, just less politely. Only "material"
+  form types are surfaced (8-K, 10-K, 10-Q, S-1, proxy statements, 13D/G,
+  6-K, 20-F, etc.) — routine Form 4 insider-trade filings are filtered out
+  since they're frequent enough to drown out everything else. The filing's
+  own metadata (form type, filing date, item codes, description) is what
+  gets extracted from — the full filing text isn't fetched, to keep this
+  cheap and fast.
+- `finnhub` needs `FINNHUB_API_KEY`; if it's missing, that backend is
+  silently skipped (not a crash) — `doctor` will flag it.
+- `stocktwits`'s public symbol-stream endpoint has historically required no
+  API key for basic reads, but financial data APIs tend to tighten terms
+  over time.
+
+All three fail soft (return no results, never raise) on a bad key, a
+rate-limit hit, or a network error — a broken financial-data backend should
+never take down a whole research run.
 
 ## Browser agent (§18, dynamic navigation)
 
@@ -376,7 +403,7 @@ Agent Orchestrator (agent.py: ResearchAgent)
    +--- Search Provider (search.py)   DuckDuckGo (default) | Tavily (optional) | Mock
    +--- Page Fetcher (fetcher.py)     static (default) | Browser Agent (browser.py, opt-in — §18)
    +--- Social Provider (social.py)   Reddit (OAuth pool via reddit_client.py, or public fallback) | Hacker News | off (default) — Phase 4, opt-in
-   +--- Financial Provider (social.py) StockTwits | off (default) — "first line" ticker-scoped sources, opt-in
+   +--- Financial Provider (social.py) SEC EDGAR | Finnhub | StockTwits | off (default) — "first line" ticker-scoped sources, opt-in, combinable
    |
 Scheduling (monitor.py)          sweep_once() / run_loop() — Phase 2, stdlib only
    |
@@ -462,12 +489,21 @@ missing functionality:
   not just normalized name) would handle the rare case of two different
   companies sharing a short common name.
 - **More financial platforms** — `social.py`'s `FinancialProvider` interface
-  currently has one implementation (StockTwits). Finnhub's free-tier company
-  news endpoint or a similar ticker-keyed source would be a second
-  `FinancialProvider` plus one line in `build_financial_from_env()` — the
-  "first line" merging logic in `agent.py`'s `investigate()` doesn't need to
-  change, since it already fetches once per session and merges whatever the
-  provider(s) return.
+  now has three implementations (SEC EDGAR, Finnhub, StockTwits), combined
+  via `CombinedFinancialProvider`. Adding another (e.g. Alpha Vantage news,
+  a specific exchange's filing feed) is one more class plus one line in
+  `build_financial_from_env()` — the "first line" merging logic in
+  `agent.py`'s `investigate()` doesn't need to change, since it already
+  fetches once per session and merges whatever the provider(s) return, and
+  each provider can supply its own `context_label` for how the LLM should
+  treat that source type.
+- **SEC full-text search** — the `sec` backend currently reads a company's
+  own recent filings via the submissions endpoint. EDGAR's separate
+  full-text search API (`efts.sec.gov`) indexes filing text across *all*
+  companies since 2001, which would let the agent search for a company's
+  name mentioned in *other* companies' filings (e.g. a supplier or
+  competitor's 10-K) — a genuinely different capability, not just more of
+  the same data.
 - **More social sources** — a subreddit-specific RSS feed or similar would
   be one more `SocialProvider` plus one line in `build_social_from_env()`.
 - **Extend the browser agent** — `browser.py`'s `max_hops` is currently 1

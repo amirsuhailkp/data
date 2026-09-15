@@ -39,6 +39,17 @@ SOURCE_RELIABILITY = {
     "social": 8,
 }
 
+# Fallback framing for a financial/trading-platform hit that doesn't supply
+# its own context_label (kept for backward compatibility with any provider
+# written before that field existed — StockTwits, Finnhub, and SEC all set
+# their own label now, see social.py).
+DEFAULT_FINANCIAL_LABEL = (
+    "[TRADING PLATFORM CHATTER — real-time trader sentiment, not verified fact; "
+    "only extract a claim from this if it describes something concrete (e.g. a "
+    "specific event being discussed), and keep confidence low unless corroborated "
+    "elsewhere in this content]"
+)
+
 RESEARCH_SYSTEM_PROMPT = """You are DataBroker, a disciplined investment research analyst.
 You investigate companies the way a careful human analyst would: you weigh source
 reliability, distinguish genuinely new information from repeats, flag contradictions
@@ -117,10 +128,12 @@ class ResearchAgent:
     # ---------- Step 3: retrieve + extract structured claims (the one step that must read text) ----------
     def gather_evidence(self, sub_question: str, company_name: str, ticker: str,
                          extra_hits: list[dict] | None = None) -> list[dict]:
-        """`extra_hits` is pre-fetched "first line" content (currently: ticker-keyed
-        financial/trading platform activity — see investigate()) that gets merged
-        in ahead of general web search results, rather than fetched fresh per
-        sub-question the way social search hits are."""
+        """`extra_hits` is pre-fetched "first line" content (ticker-keyed financial
+        sources: SEC filings, Finnhub news, StockTwits chatter — see investigate())
+        that gets merged in ahead of general web search results, rather than
+        fetched fresh per sub-question the way social search hits are. Each hit
+        may carry its own `context_label` describing how the LLM should treat
+        that source type (falls back to DEFAULT_FINANCIAL_LABEL if absent)."""
         queries = self.plan_search_queries(sub_question, company_name, ticker)
 
         hits = []
@@ -165,11 +178,9 @@ class ResearchAgent:
             content = h.get("snippet", "")
             if not content:
                 continue
+            label = h.get("context_label", DEFAULT_FINANCIAL_LABEL)
             context_blocks.append(
-                "[TRADING PLATFORM CHATTER — real-time trader sentiment, not verified fact; "
-                "only extract a claim from this if it describes something concrete (e.g. a "
-                "specific event being discussed), and keep confidence low unless corroborated "
-                f"elsewhere in this content]\nURL: {h['url']}\nTitle: {h.get('title', '')}\n"
+                f"{label}\nURL: {h['url']}\nTitle: {h.get('title', '')}\n"
                 f"Content: {content[:MAX_FETCH_CHARS]}"
             )
         for h in hits[:MAX_SEARCH_HITS_PER_QUESTION]:

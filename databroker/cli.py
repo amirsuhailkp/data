@@ -274,7 +274,15 @@ def cmd_doctor(db: DB, args):
             print("  Reddit auth   = none configured — using unauthenticated public search "
                   "(lower, less predictable rate limit). Set REDDIT_CLIENT_ID(_N)/"
                   "REDDIT_CLIENT_SECRET(_N) to use the OAuth pool instead.")
-    print("FINANCIAL_BACKEND =", os.environ.get("FINANCIAL_BACKEND", "off (default)"))
+    fin_backend = os.environ.get("FINANCIAL_BACKEND", "off")
+    print("FINANCIAL_BACKEND =", fin_backend or "off (default)")
+    fin_names = [b.strip().lower() for b in fin_backend.split(",") if b.strip()]
+    if "finnhub" in fin_names:
+        print("  Finnhub       =", "API key set" if os.environ.get("FINNHUB_API_KEY") else
+              "NOT configured — set FINNHUB_API_KEY (free tier at finnhub.io) or this source is skipped")
+    if "sec" in fin_names:
+        print("  SEC EDGAR     =", f"contact set ({os.environ.get('SEC_EDGAR_CONTACT')})" if os.environ.get("SEC_EDGAR_CONTACT")
+              else "no SEC_EDGAR_CONTACT set — works, but SEC's fair-access policy asks for a contact string in the User-Agent")
     print("FETCHER_BACKEND =", os.environ.get("FETCHER_BACKEND", "static (default)"))
     if os.environ.get("FETCHER_BACKEND", "static").lower() == "browser":
         try:
