@@ -270,10 +270,20 @@ def cmd_connections(db: DB, args):
 
 def cmd_doctor(db: DB, args):
     import os
-    from .llm import OllamaProvider
+    from .llm import OllamaProvider, FreeLLMAPIProvider
 
     print("LLM_BACKEND     =", os.environ.get("LLM_BACKEND", "auto (not set)"))
     print("Ollama running? =", OllamaProvider.is_available())
+    if os.environ.get("FREELLMAPI_API_KEY"):
+        freellmapi_url = os.environ.get("FREELLMAPI_BASE_URL", "http://localhost:3001/v1")
+        if FreeLLMAPIProvider.is_available(freellmapi_url):
+            print(f"freellmapi      = reachable at {freellmapi_url}, model="
+                  f"{os.environ.get('FREELLMAPI_MODEL', 'auto')}")
+        else:
+            print(f"freellmapi      = FREELLMAPI_API_KEY is set but {freellmapi_url} is NOT reachable — "
+                  f"is the container running? (`docker compose up` in the freellmapi repo)")
+    else:
+        print("freellmapi      = not configured (set FREELLMAPI_API_KEY to use it)")
     print("GROQ_API_KEY    =", "set" if os.environ.get("GROQ_API_KEY") else "not set")
     print("GEMINI_API_KEY  =", "set" if os.environ.get("GEMINI_API_KEY") else "not set")
     print("SEARCH_BACKEND  =", os.environ.get("SEARCH_BACKEND", "duckduckgo (default)"))
@@ -325,8 +335,11 @@ def cmd_doctor(db: DB, args):
         except ImportError:
             print("Playwright       = NOT installed — will silently fall back to static fetch. "
                   "Run: pip install playwright && playwright install chromium")
-    provider = build_provider_from_env()
-    print("\n-> Resolved LLM provider:", type(provider).__name__)
+    try:
+        provider = build_provider_from_env()
+        print("\n-> Resolved LLM provider:", type(provider).__name__)
+    except ValueError as e:
+        print(f"\n-> LLM provider resolution FAILED: {e}")
 
 
 def cmd_sweep(db: DB, args):

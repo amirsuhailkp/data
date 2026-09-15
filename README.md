@@ -9,8 +9,9 @@ matters — without predicting prices or placing trades.
 decision.** Two design choices work together to make this cheap enough to run
 on free-tier APIs or a local model:
 
-1. **Free/local model backends** (`llm.py`) — Ollama (fully local), Groq or
-   Gemini (free-tier cloud), or a hybrid mix.
+1. **Free/local model backends** (`llm.py`) — Ollama (fully local),
+   freellmapi (self-hosted multi-provider router with built-in rate-limit
+   fallover), Groq or Gemini (free-tier cloud), or a hybrid mix.
 2. **The LLM only does what only it can do** (`heuristics.py`) — reading
    fetched web text and extracting claims, and resolving genuinely ambiguous
    judgment calls. Every mechanical decision is handled by plain Python with
@@ -73,9 +74,42 @@ fallback for the genuinely unclear cases, never skipped entirely.
 | Backend | Cost | Quality | Setup |
 |---|---|---|---|
 | **Ollama** (local) | Free | Depends on your hardware — `qwen2.5:14b` is a meaningfully better JSON-follower than `7b` if you can run it | `ollama pull qwen2.5:7b` (or `14b`), then `ollama serve` |
+| **freellmapi** (local router) | Free | Depends on which free-tier providers you register behind it — typically as good as your best configured provider, with automatic fallover away from whichever one is rate-limited at the moment | Run [freellmapi](https://github.com/tashfeenahmed/freellmapi) locally (`docker compose up`), grab a unified key from its dashboard |
 | **Groq** (cloud) | Free tier (rate-limited) | Currently the best free-tier reasoning quality — `openai/gpt-oss-120b` | Free key at console.groq.com |
 | **Gemini** (cloud) | Free tier (rate-limited), Flash-only since Pro was pulled from free tier in 2026 | Good, but no longer Gemini's best model | Free key at aistudio.google.com/apikey |
 | **Hybrid** | Free | Best free option — cloud model for plan/report/thesis, local for the rest | Set up both Ollama and one cloud key |
+
+**Why freellmapi is worth it if you're hitting rate limits:** a `research`
+run fires several LLM calls back-to-back (plan → one extract per
+subquestion → conflict-check → thesis → report — 8-9+ calls with no
+pacing between them), which reliably trips a single free-tier provider's
+per-minute cap. `GroqProvider`/`GeminiProvider` now retry with backoff on
+a 429 (see below), but if you're still hitting the wall, running
+freellmapi locally and pointing `LLM_BACKEND=freellmapi` at it spreads
+that same burst across every free-tier provider you've registered in its
+dashboard — Groq, Gemini, Cerebras, Mistral, OpenRouter, and more — so one
+provider's cooldown doesn't stall the whole run. Model defaults to
+`"auto"`, which follows whichever fallback chain is active in the
+dashboard; `auto:fast`/`auto:smart`/`auto:<profile-name>` steer a single
+request without touching the dashboard. With `LLM_BACKEND=freellmapi`,
+if the container isn't reachable (or `FREELLMAPI_API_KEY` isn't set),
+databroker automatically falls back to local Ollama if it's running,
+then `MockProvider` as a last resort — so it never hard-crashes just
+because the container was restarted.
+
+**`LLM_BACKEND` is validated** — an unrecognized value (e.g. a typo like
+`api`) raises a clear error listing the valid options, rather than
+silently behaving like `auto`. `doctor` catches this and prints it
+inline instead of a raw traceback.
+
+**Free-tier rate limits (429s):** `GroqProvider` and `GeminiProvider` both
+retry automatically on a 429, honoring the provider's `Retry-After` header
+when present and falling back to exponential backoff (1s/2s/4s/8s/16s)
+otherwise, printing each retry attempt so you can see it happening. If it's
+still 429ing after 5 retries, that's a real "you've exceeded free-tier
+capacity for this burst" — either lower `RESEARCH_MAX_SUBQUESTIONS` in
+`.env`, switch to `LLM_BACKEND=hybrid`/`freellmapi` to spread load, or just
+wait a minute and retry.
 
 **Model IDs move fast on both free tiers — worth knowing before you hit a
 400 error:**
@@ -117,7 +151,7 @@ Run `python -m databroker.cli doctor` any time to see which backend is active.
 | §11 Source Verification | ✅ every claim stores source, type, reliability tier, verification status |
 | §12 Conflict Detection | ✅ overlap-filtered before any LLM call |
 | §13 Personal Research Memory | ✅ SQLite-backed |
-| §16 Model abstraction | ✅ Ollama / Groq / Gemini / Hybrid / Claude(optional) / Mock, all behind one interface |
+| §16 Model abstraction | ✅ Ollama / freellmapi / Groq / Gemini / Hybrid / Claude(optional) / Mock, all behind one interface |
 | §23 Daily Intelligence Brief | ✅ `digest` — pure DB read, zero LLM calls |
 | §26 Boundary: research, not trading | ✅ enforced in the system prompt |
 | Scheduled/background monitoring (Phase 2) | ✅ `sweep` (cron-friendly one-shot) and `watch-loop` (long-running, stdlib-only, no new dependency) |
@@ -461,7 +495,7 @@ Agent Orchestrator (agent.py: ResearchAgent)
    |  - build_report()           0 LLM calls if no evidence was found, else 1 call
    |  - daily_digest()           0 LLM calls — pure DB read
    |
-   +--- LLM Provider (llm.py)      Ollama | Groq | Gemini | Hybrid | Claude(optional) | Mock
+   +--- LLM Provider (llm.py)      Ollama | freellmapi | Groq | Gemini | Hybrid | Claude(optional) | Mock
    +--- Heuristics (heuristics.py) zero-token search/dedup/scoring/conflict logic
    +--- Search Provider (search.py)   DuckDuckGo (default) | Tavily (optional) | Mock
    +--- Page Fetcher (fetcher.py)     static (default) | Browser Agent (browser.py, opt-in — §18)
@@ -497,6 +531,7 @@ the same way, just only for that terminal session:
 
 ```bash
 export LLM_BACKEND=ollama                    # + ollama pull qwen2.5:7b && ollama serve
+export LLM_BACKEND=freellmapi; export FREELLMAPI_API_KEY=freellmapi-...  # + freellmapi running locally (docker compose up)
 export LLM_BACKEND=groq; export GROQ_API_KEY=gsk_...       # free at console.groq.com
 export LLM_BACKEND=gemini; export GEMINI_API_KEY=...        # free at aistudio.google.com/apikey
 export LLM_BACKEND=hybrid; export GROQ_API_KEY=gsk_...      # + Ollama running too

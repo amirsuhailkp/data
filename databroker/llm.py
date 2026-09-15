@@ -3,12 +3,19 @@ LLM provider abstraction.
 
 No paid model is required. Supported backends:
 
-  - OllamaProvider   : fully local, free, needs Ollama running (https://ollama.com)
-  - GroqProvider     : free-tier cloud, very fast inference (needs a free GROQ_API_KEY)
-  - GeminiProvider   : free-tier cloud (needs a free GEMINI_API_KEY from Google AI Studio)
-  - ClaudeProvider   : optional, paid — kept for later, never selected by default
-  - MockProvider     : offline, deterministic, for testing without any of the above
-  - HybridProvider   : routes each task (plan/extract/score/dedupe/conflict/thesis/report)
+  - OllamaProvider     : fully local, free, needs Ollama running (https://ollama.com)
+  - GroqProvider       : free-tier cloud, very fast inference (needs a free GROQ_API_KEY)
+  - GeminiProvider     : free-tier cloud (needs a free GEMINI_API_KEY from Google AI Studio)
+  - FreeLLMAPIProvider : local multi-provider LLM router/gateway (needs a local freellmapi
+                         instance — https://github.com/tashfeenahmed/freellmapi — running,
+                         default http://localhost:3001). Fans a single request out across
+                         whichever free-tier providers you've configured behind it (Groq,
+                         Gemini, Cerebras, Mistral, OpenRouter, etc.) and handles rate-limit
+                         fallover between them itself, so it's a good fit when a single
+                         provider's free-tier cap (e.g. Groq 429s) is the bottleneck.
+  - ClaudeProvider     : optional, paid — kept for later, never selected by default
+  - MockProvider       : offline, deterministic, for testing without any of the above
+  - HybridProvider     : routes each task (plan/extract/score/dedupe/conflict/thesis/report)
                         to whichever of the above providers you assign it to, so you can
                         mix "cheap local model for repetitive extraction" with "a stronger
                         free-cloud model for the harder reasoning steps" (or run 100% local).
@@ -23,9 +30,45 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 
 import requests
+
+
+def _post_with_retry(url: str, max_retries: int = 5, **kwargs) -> requests.Response:
+    """POST with retry/backoff on 429 (rate limit) and transient 5xx errors.
+
+    Free-tier LLM backends (Groq, Gemini) enforce per-minute request and/or
+    token caps. A multi-step `research` run fires several calls back-to-back
+    (plan, one extract per subquestion, conflict-check, thesis, report) with
+    no pacing between them, which reliably trips these caps even on light
+    usage. Rather than let the whole research run die on the first 429,
+    retry with backoff — honoring the server's `Retry-After` header when
+    present (both Groq and Gemini send one), falling back to exponential
+    backoff (1s, 2s, 4s, 8s, 16s) otherwise. Any other status/error is
+    surfaced immediately, unchanged.
+    """
+    last_resp = None
+    for attempt in range(max_retries + 1):
+        resp = requests.post(url, **kwargs)
+        if resp.status_code != 429 and resp.status_code < 500:
+            return resp
+        last_resp = resp
+        if attempt == max_retries:
+            break
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                wait = max(float(retry_after), 0.5)
+            except ValueError:
+                wait = 2.0 ** attempt
+        else:
+            wait = 2.0 ** attempt
+        print(f"[databroker] Rate limited (HTTP {resp.status_code}) — "
+              f"retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})...")
+        time.sleep(wait)
+    return last_resp
 
 
 class LLMProvider(ABC):
@@ -145,7 +188,7 @@ class GroqProvider(LLMProvider):
 
     def complete_json(self, system: str, prompt: str, schema_hint: str, task: str = "general") -> dict:
         full_prompt = _build_prompt(prompt, schema_hint)
-        resp = requests.post(
+        resp = _post_with_retry(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
@@ -166,6 +209,13 @@ class GroqProvider(LLMProvider):
             )
         if resp.status_code == 401:
             raise RuntimeError("Groq returned 401 Unauthorized — check GROQ_API_KEY is set correctly.")
+        if resp.status_code == 429:
+            raise RuntimeError(
+                "Groq returned 429 Too Many Requests even after retrying with backoff — "
+                "you're hitting the free-tier rate limit faster than backoff can clear it. "
+                "Try again shortly, lower RESEARCH_MAX_SUBQUESTIONS in .env, or set "
+                "LLM_BACKEND=hybrid to split load across Groq and Gemini."
+            )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
         return _extract_json(content)
@@ -194,7 +244,7 @@ class GeminiProvider(LLMProvider):
             f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
             f"?key={self.api_key}"
         )
-        resp = requests.post(
+        resp = _post_with_retry(
             url,
             json={
                 "system_instruction": {"parts": [{"text": system}]},
@@ -203,6 +253,12 @@ class GeminiProvider(LLMProvider):
             },
             timeout=60,
         )
+        if resp.status_code == 429:
+            raise RuntimeError(
+                "Gemini returned 429 Too Many Requests even after retrying with backoff — "
+                "you're hitting the free-tier rate limit faster than backoff can clear it. "
+                "Try again shortly or lower RESEARCH_MAX_SUBQUESTIONS in .env."
+            )
         resp.raise_for_status()
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -210,6 +266,100 @@ class GeminiProvider(LLMProvider):
 
     def describe(self) -> str:
         return f"Gemini ({self.model})"
+
+
+# ---------------------------------------------------------------------------
+# Local: freellmapi (self-hosted multi-provider LLM router/gateway)
+# https://github.com/tashfeenahmed/freellmapi
+# ---------------------------------------------------------------------------
+class FreeLLMAPIProvider(LLMProvider):
+    """Talks to a locally-running freellmapi gateway over its OpenAI-compatible
+    endpoint. freellmapi itself fans a request out across whichever free-tier
+    providers you've configured behind it (Groq, Gemini, Cerebras, Mistral,
+    OpenRouter, GitHub Models, HuggingFace, Cloudflare, Cohere, ...) and
+    retries/fails over between them when one is rate-limited or down — so it
+    absorbs exactly the kind of single-provider 429 that GroqProvider/
+    GeminiProvider hit on their own, without databroker needing to know which
+    underlying provider actually served the request.
+
+    Needs freellmapi running locally (default: `docker compose up` per its
+    README, listening on http://localhost:3001) and a unified API key from
+    its dashboard's Keys page. Model defaults to "auto", which follows
+    whichever fallback chain is active in the freellmapi dashboard; use
+    "auto:fast", "auto:smart", "auto:<profile-name>", or a specific catalog
+    model id to steer a single request instead (see freellmapi's API docs).
+    """
+
+    def __init__(self, base_url: str | None = None, api_key: str | None = None, model: str | None = None):
+        self.base_url = (base_url or os.environ.get("FREELLMAPI_BASE_URL", "http://localhost:3001/v1")).rstrip("/")
+        self.api_key = api_key or os.environ.get("FREELLMAPI_API_KEY")
+        self.model = model or os.environ.get("FREELLMAPI_MODEL", "auto")
+        if not self.api_key:
+            raise RuntimeError(
+                "FREELLMAPI_API_KEY not set. Get your unified key from the freellmapi "
+                "dashboard's Keys page (freellmapi must be running locally first — see "
+                "https://github.com/tashfeenahmed/freellmapi)."
+            )
+        self.last_routed_via: str | None = None
+
+    def complete_json(self, system: str, prompt: str, schema_hint: str, task: str = "general") -> dict:
+        full_prompt = _build_prompt(prompt, schema_hint)
+        try:
+            resp = _post_with_retry(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": full_prompt},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.2,
+                },
+                timeout=90,
+            )
+        except requests.ConnectionError as e:
+            raise RuntimeError(
+                f"Could not reach freellmapi at {self.base_url}. Is it running? "
+                f"(default: `docker compose up` in the freellmapi repo, listening on "
+                f"http://localhost:3001) (underlying error: {e})"
+            ) from e
+        if resp.status_code == 401:
+            raise RuntimeError(
+                "freellmapi returned 401 Unauthorized — check FREELLMAPI_API_KEY matches "
+                "the unified key shown on its dashboard's Keys page."
+            )
+        if resp.status_code == 400:
+            raise RuntimeError(
+                f"freellmapi returned 400 for model '{self.model}' — check it's a valid "
+                f"catalog model id or routing alias (e.g. 'auto', 'auto:fast', "
+                f"'auto:<profile-name>'). Response: {resp.text[:300]}"
+            )
+        if resp.status_code == 429:
+            raise RuntimeError(
+                "freellmapi returned 429 even after retrying with backoff — every provider "
+                "in its active fallback chain is currently exhausted or rate-limited. Check "
+                "the freellmapi dashboard for provider/key status, or add more free-tier "
+                "keys to its chain."
+            )
+        resp.raise_for_status()
+        self.last_routed_via = resp.headers.get("x-routed-via")
+        content = resp.json()["choices"][0]["message"]["content"]
+        return _extract_json(content)
+
+    def describe(self) -> str:
+        via = f", last routed via {self.last_routed_via}" if self.last_routed_via else ""
+        return f"FreeLLMAPI ({self.model} @ {self.base_url}{via})"
+
+    @staticmethod
+    def is_available(base_url: str | None = None) -> bool:
+        url = (base_url or os.environ.get("FREELLMAPI_BASE_URL", "http://localhost:3001/v1")).rstrip("/")
+        try:
+            requests.get(f"{url}/models", timeout=2)
+            return True
+        except requests.RequestException:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -282,20 +432,39 @@ class HybridProvider(LLMProvider):
 def build_provider_from_env() -> LLMProvider:
     """
     Env vars:
-      LLM_BACKEND = auto (default) | ollama | groq | gemini | hybrid | claude | mock
+      LLM_BACKEND = auto (default) | ollama | groq | gemini | freellmapi | hybrid | claude | mock
 
-    auto: uses Ollama if it's running locally, else Groq if GROQ_API_KEY is set,
-          else Gemini if GEMINI_API_KEY is set, else falls back to MockProvider.
+    auto: uses Ollama if it's running locally, else freellmapi if it's running locally
+          (FREELLMAPI_API_KEY set), else Groq if GROQ_API_KEY is set, else Gemini if
+          GEMINI_API_KEY is set, else falls back to MockProvider.
+
+    freellmapi: freellmapi is primary. If it's unreachable or FREELLMAPI_API_KEY isn't
+                set, falls back to local Ollama automatically (if running), then
+                MockProvider as a last resort — so a Docker container going down
+                doesn't hard-crash your next research run.
 
     hybrid: builds a HybridProvider. Reasoning-heavy tasks (plan, report, thesis)
-            go to Groq/Gemini if a free-tier key is present (better quality);
+            go to freellmapi/Groq/Gemini if available (better quality, and freellmapi
+            in particular absorbs single-provider rate limits via its own fallover);
             everything else goes to local Ollama if available. Falls back
             sensibly if only one option exists.
     """
+    VALID_BACKENDS = {"auto", "ollama", "groq", "gemini", "freellmapi", "hybrid", "claude", "mock"}
     backend = os.environ.get("LLM_BACKEND", "auto").lower()
+
+    if backend not in VALID_BACKENDS:
+        hint = " (did you mean 'freellmapi'? there's no backend called 'api')" if backend == "api" else ""
+        raise ValueError(
+            f"Unknown LLM_BACKEND='{backend}'{hint}. Valid values: {', '.join(sorted(VALID_BACKENDS))}."
+        )
 
     def try_ollama():
         return OllamaProvider() if OllamaProvider.is_available() else None
+
+    def try_freellmapi():
+        if not os.environ.get("FREELLMAPI_API_KEY"):
+            return None
+        return FreeLLMAPIProvider() if FreeLLMAPIProvider.is_available() else None
 
     def try_groq():
         return GroqProvider() if os.environ.get("GROQ_API_KEY") else None
@@ -305,6 +474,21 @@ def build_provider_from_env() -> LLMProvider:
 
     if backend == "ollama":
         return OllamaProvider()
+    if backend == "freellmapi":
+        primary = try_freellmapi()
+        if primary:
+            return primary
+        fallback = try_ollama()
+        import sys
+        base_url = os.environ.get("FREELLMAPI_BASE_URL", "http://localhost:3001/v1")
+        print(
+            f"[databroker] LLM_BACKEND=freellmapi but it isn't reachable/configured "
+            f"(check FREELLMAPI_API_KEY is set and the container is up at {base_url}) — "
+            + ("falling back to local Ollama." if fallback else
+               "falling back to MockProvider (Ollama isn't running either)."),
+            file=sys.stderr,
+        )
+        return fallback or MockProvider()
     if backend == "groq":
         return GroqProvider()
     if backend == "gemini":
@@ -316,7 +500,7 @@ def build_provider_from_env() -> LLMProvider:
 
     if backend == "hybrid":
         local = try_ollama()
-        cloud = try_groq() or try_gemini()
+        cloud = try_freellmapi() or try_groq() or try_gemini()
         if local and cloud:
             heavy_tasks = {"plan", "report", "thesis"}
             return HybridProvider(default=local, overrides={t: cloud for t in heavy_tasks})
@@ -324,14 +508,17 @@ def build_provider_from_env() -> LLMProvider:
 
     # auto
     local = try_ollama()
+    router = try_freellmapi()
     cloud_groq = try_groq()
     cloud_gemini = try_gemini()
-    if local and (cloud_groq or cloud_gemini):
+    active_extras = [p for p in (router, cloud_groq, cloud_gemini) if p]
+    if local and active_extras:
         import sys
         print(
-            "[databroker] LLM_BACKEND=auto: Ollama is running locally AND a cloud API key is set — "
-            "defaulting to local Ollama. If you meant to use Groq/Gemini instead, set LLM_BACKEND "
-            "explicitly (e.g. LLM_BACKEND=groq) rather than relying on auto-detection.",
+            "[databroker] LLM_BACKEND=auto: Ollama is running locally AND another backend "
+            "is configured — defaulting to local Ollama. If you meant to use freellmapi/"
+            "Groq/Gemini instead, set LLM_BACKEND explicitly (e.g. LLM_BACKEND=freellmapi) "
+            "rather than relying on auto-detection.",
             file=sys.stderr,
         )
-    return local or cloud_groq or cloud_gemini or MockProvider()
+    return local or router or cloud_groq or cloud_gemini or MockProvider()
