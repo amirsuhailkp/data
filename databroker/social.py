@@ -291,6 +291,183 @@ class MockFinnhubProvider(FinancialProvider):
 
 
 # ---------------------------------------------------------------------------
+# Alpaca — real-time (Benzinga-sourced) financial news, free on Alpaca's
+# Basic market-data plan. Needs a free PAPER trading account (email + MFA,
+# no KYC/funding required for paper-only) to get an API key/secret pair —
+# see https://alpaca.markets/docs/api-references/market-data-api/news-data/.
+# This is the fastest "first line" source this tool has: news is pushed to
+# the feed close to publication time rather than picked up on a search-engine
+# crawl delay, which is the actual gap day-trading use cases care about.
+# ---------------------------------------------------------------------------
+class AlpacaNewsProvider(FinancialProvider):
+    """Fails soft (returns []) on missing/invalid credentials, a rate-limit
+    hit, or any network error — same contract as the other financial
+    providers here."""
+
+    def __init__(self, api_key: str, api_secret: str, lookback_hours: int = 48):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.lookback_hours = lookback_hours
+
+    def get_ticker_activity(self, ticker: str, max_results: int = 10) -> list[dict]:
+        since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=self.lookback_hours)
+        try:
+            resp = requests.get(
+                "https://data.alpaca.markets/v1beta1/news",
+                params={
+                    "symbols": ticker.upper(),
+                    "start": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "limit": max_results,
+                    "sort": "desc",
+                    "include_content": "false",
+                },
+                headers={
+                    **HEADERS,
+                    "APCA-API-KEY-ID": self.api_key,
+                    "APCA-API-SECRET-KEY": self.api_secret,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError):
+            return []
+
+        news = data.get("news") if isinstance(data, dict) else None
+        if not isinstance(news, list):
+            return []  # bad/expired credentials come back as an error object, not this shape
+
+        results = []
+        for item in news[:max_results]:
+            headline = (item.get("headline") or "").strip()
+            url = item.get("url") or ""
+            if not headline or not url:
+                continue
+            pub_date = (item.get("created_at") or "")[:10] or None
+            summary = (item.get("summary") or "").strip()
+            source = item.get("source") or "Alpaca/Benzinga"
+            results.append({
+                "title": f"{source}: {headline}",
+                "url": url,
+                "snippet": summary or headline,
+                "source_type": "news",
+                "publication_date": pub_date,
+                "context_label": (
+                    "[REAL-TIME NEWS WIRE — pushed near publication time, treat like any "
+                    "other news content but note it may be very recent/still developing]"
+                ),
+            })
+        return results
+
+
+class MockAlpacaProvider(FinancialProvider):
+    def get_ticker_activity(self, ticker: str, max_results: int = 10) -> list[dict]:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Alpha Vantage News & Sentiment — free, NASDAQ-licensed, and genuinely
+# distinct from the other news providers here: every article carries an
+# AI-assigned sentiment score, both overall and per-ticker (so a "Neutral"
+# headline that specifically calls out one of your tracked tickers as
+# "Somewhat Bearish" is visible directly in the extraction prompt, not left
+# for the LLM to infer from tone).
+#
+# The real constraint: the free key is capped at 25 requests/day, TOTAL,
+# across every function on the account — not just this one. That's fine for
+# `sweep`/`research` on a modest watchlist (each company costs exactly one
+# call here, regardless of how many articles come back), but it runs out
+# fast combined with `watch-loop --interval-minutes` polling, and doesn't
+# reset until the API's own daily window rolls over. Treat this as a
+# daily/periodic-checkup source, not a day-trading fast-polling one — see
+# README for the full trade-off.
+# ---------------------------------------------------------------------------
+class AlphaVantageNewsProvider(FinancialProvider):
+    """Fails soft (returns []) on a missing/invalid key, the daily quota
+    being exhausted, or any network error — same contract as the other
+    financial providers here. Alpha Vantage signals a quota/param problem
+    with a 200 OK carrying an "Information" or "Note" key instead of the
+    normal "feed" list, so that's checked explicitly rather than relying on
+    an HTTP error status, which this API doesn't raise for rate limits."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def get_ticker_activity(self, ticker: str, max_results: int = 10) -> list[dict]:
+        try:
+            resp = requests.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function": "NEWS_SENTIMENT",
+                    "tickers": ticker.upper(),
+                    "limit": max_results,
+                    "apikey": self.api_key,
+                },
+                headers=HEADERS, timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError):
+            return []
+
+        if not isinstance(data, dict) or "feed" not in data:
+            # "Information"/"Note" keys mean quota exhausted or a bad
+            # param — either way, fail soft rather than raising.
+            return []
+
+        feed = data.get("feed")
+        if not isinstance(feed, list):
+            return []
+
+        results = []
+        for item in feed[:max_results]:
+            title = (item.get("title") or "").strip()
+            url = item.get("url") or ""
+            if not title or not url:
+                continue
+            time_published = item.get("time_published") or ""  # e.g. "20260910T143000"
+            pub_date = (
+                f"{time_published[0:4]}-{time_published[4:6]}-{time_published[6:8]}"
+                if len(time_published) >= 8 else None
+            )
+            summary = (item.get("summary") or "").strip()
+            source = item.get("source") or "Alpha Vantage"
+
+            # Prefer the sentiment specific to THIS ticker over the
+            # article's overall sentiment, when available — a broad-market
+            # article mentioning the ticker in passing may be "Neutral"
+            # overall but genuinely bullish/bearish for this name specifically.
+            ticker_label, ticker_score = None, None
+            for ts in (item.get("ticker_sentiment") or []):
+                if (ts.get("ticker") or "").upper() == ticker.upper():
+                    ticker_label = ts.get("ticker_sentiment_label")
+                    ticker_score = ts.get("ticker_sentiment_score")
+                    break
+            sentiment_label = ticker_label or item.get("overall_sentiment_label")
+            sentiment_note = f" [AI sentiment for {ticker.upper()}: {sentiment_label}]" if sentiment_label else ""
+
+            results.append({
+                "title": f"{source}: {title}{sentiment_note}",
+                "url": url,
+                "snippet": summary or title,
+                "source_type": "news",
+                "publication_date": pub_date,
+                "context_label": (
+                    "[FINANCIAL NEWS + AI SENTIMENT SCORE — this source tags each article "
+                    "with an automated bullish/bearish sentiment label; treat the label as "
+                    "a machine-generated signal to note, not a substitute for reading what "
+                    "the article actually reports]"
+                ),
+            })
+        return results
+
+
+class MockAlphaVantageProvider(FinancialProvider):
+    def get_ticker_activity(self, ticker: str, max_results: int = 10) -> list[dict]:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # SEC EDGAR — official filings. Free, no API key, but the fair-access policy
 # requires a descriptive User-Agent identifying who's calling (see
 # https://www.sec.gov/search-filings/edgar-application-programming-interfaces).
@@ -472,14 +649,20 @@ def build_social_from_env() -> SocialProvider | None:
 def build_financial_from_env() -> FinancialProvider | None:
     """
     Env var: FINANCIAL_BACKEND = off (default) | comma-separated list of:
-      stocktwits | finnhub | sec
+      stocktwits | finnhub | sec | alpaca | alphavantage
 
-    e.g. FINANCIAL_BACKEND=sec,finnhub,stocktwits combines all three.
-    `sec` is free with no key; `finnhub` needs FINNHUB_API_KEY (free tier,
-    finnhub.io) and is silently skipped (not a crash) if the key is missing
-    — `doctor` will flag that. `sec` works better with SEC_EDGAR_CONTACT set
-    (a contact string SEC's fair-access policy asks for) but still runs
-    without it.
+    e.g. FINANCIAL_BACKEND=sec,finnhub,stocktwits,alpaca,alphavantage combines
+    all five. `sec` is free with no key; `finnhub` needs FINNHUB_API_KEY (free
+    tier, finnhub.io) and is silently skipped (not a crash) if the key is
+    missing — `doctor` will flag that. `sec` works better with
+    SEC_EDGAR_CONTACT set (a contact string SEC's fair-access policy asks
+    for) but still runs without it. `alpaca` needs ALPACA_API_KEY_ID +
+    ALPACA_API_SECRET_KEY (free from a paper-trading account, alpaca.markets)
+    and is silently skipped if either is missing. `alphavantage` needs
+    ALPHA_VANTAGE_API_KEY (free, alphavantage.co) and is silently skipped if
+    missing — note its free tier is capped at 25 requests/day TOTAL across
+    the whole account, so it's a poor fit combined with fast interval
+    polling; see README.
     """
     backend = os.environ.get("FINANCIAL_BACKEND", "off").lower()
     if backend in ("off", ""):
@@ -496,6 +679,15 @@ def build_financial_from_env() -> FinancialProvider | None:
                 providers.append(FinnhubNewsProvider(api_key))
         elif name == "sec":
             providers.append(SECFilingsProvider())
+        elif name == "alpaca":
+            key_id = os.environ.get("ALPACA_API_KEY_ID", "")
+            secret = os.environ.get("ALPACA_API_SECRET_KEY", "")
+            if key_id and secret:
+                providers.append(AlpacaNewsProvider(key_id, secret))
+        elif name == "alphavantage":
+            av_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+            if av_key:
+                providers.append(AlphaVantageNewsProvider(av_key))
 
     if not providers:
         return None

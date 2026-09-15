@@ -121,7 +121,7 @@ Run `python -m databroker.cli doctor` any time to see which backend is active.
 | §23 Daily Intelligence Brief | ✅ `digest` — pure DB read, zero LLM calls |
 | §26 Boundary: research, not trading | ✅ enforced in the system prompt |
 | Scheduled/background monitoring (Phase 2) | ✅ `sweep` (cron-friendly one-shot) and `watch-loop` (long-running, stdlib-only, no new dependency) |
-| §5 Social & Community Intelligence (Phase 4) | ✅ opt-in (`SOCIAL_BACKEND`) — Reddit (OAuth pool, multi-app throughput) + Hacker News, plus opt-in `FINANCIAL_BACKEND` for SEC EDGAR filings + Finnhub news + StockTwits as "first line" ticker-scoped sources — see below |
+| §5 Social & Community Intelligence (Phase 4) | ✅ opt-in (`SOCIAL_BACKEND`) — Reddit (OAuth pool, multi-app throughput) + Hacker News, plus opt-in `FINANCIAL_BACKEND` for SEC EDGAR filings + Finnhub news + Alpaca real-time news + Alpha Vantage sentiment news + StockTwits as "first line" ticker-scoped sources — see below |
 | §18 Full browser agent (dynamic navigation) | ✅ opt-in (`FETCHER_BACKEND=browser`) — JS rendering + one bounded, mostly-deterministic navigation hop past index/listing pages — see below |
 | Knowledge graph (Phase 5) | ✅ lightweight property graph on SQLite — entities/relationships extracted alongside regular research, zero extra LLM calls — see below |
 
@@ -193,14 +193,27 @@ a different trust category than a filing or a news article:
 ## Real-time financial/trading platforms ("first line" sources)
 
 Off by default — turn it on with `FINANCIAL_BACKEND=<comma-separated list>`,
-e.g. `FINANCIAL_BACKEND=sec,finnhub,stocktwits` to combine all three, or
-just `FINANCIAL_BACKEND=sec` for the free, no-key option on its own.
+e.g. `FINANCIAL_BACKEND=sec,finnhub,stocktwits,alpaca,alphavantage` to combine
+all five, or just `FINANCIAL_BACKEND=sec` for the free, no-key option on its own.
 
 | Backend | What it is | Cost | Source type / reliability tier |
 |---|---|---|---|
 | `sec` | Official SEC EDGAR filings (8-K, 10-K, 10-Q, S-1, proxy statements, 13D/G, etc.) via `data.sec.gov` | Free, no API key | `filing`, tier **1** — the single highest-reliability source this tool has |
 | `finnhub` | Finnhub's company-news wire (`company-news` endpoint) | Free tier (~60 calls/min), needs `FINNHUB_API_KEY` from finnhub.io | `news`, tier 5 — same tier as general web news |
+| `alpaca` | Alpaca's Benzinga-sourced real-time news feed — pushed close to publication time, the fastest source here | Free, needs a paper-trading account (`ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY`) at alpaca.markets | `news`, tier 5 — same tier as Finnhub, just faster |
+| `alphavantage` | Alpha Vantage's NASDAQ-licensed news feed, with an AI sentiment score per article (overall AND per-ticker) | Free, needs `ALPHA_VANTAGE_API_KEY` — but capped at **25 requests/day total** on the account | `news`, tier 5 — differentiated by the sentiment label, not speed |
 | `stocktwits` | StockTwits' public symbol stream — real trader chatter/sentiment | Free, no key (historically) | `community`, tier 7 — sentiment/discussion, not verified fact |
+
+**If you're using this for day trading**, `alpaca` is the one to turn on —
+it's specifically built for low-latency news, not just another news source
+API. Pair it with `watch-loop --interval-minutes` (see "Scheduled
+monitoring" below) instead of a daily sweep, since once-a-day is too slow
+for that use case. **`alphavantage` is the wrong fit for that same fast-
+polling setup** — its 25-req/day cap is account-wide, so a handful of
+interval-polling ticks will exhaust the whole day's quota in minutes. It's
+a good match for the once-a-day `sweep`/`research` workflow instead, on a
+watchlist small enough to fit inside 25 checks a day, where its sentiment
+labels add something Finnhub/Alpaca's plain news doesn't have.
 
 Unlike Reddit/HN (free-text searchable), these are all inherently
 ticker-scoped — activity about one specific symbol, not something you query
@@ -238,11 +251,27 @@ with arbitrary text. That's reflected in how they're wired in (`social.py`'s
   cheap and fast.
 - `finnhub` needs `FINNHUB_API_KEY`; if it's missing, that backend is
   silently skipped (not a crash) — `doctor` will flag it.
+- `alpaca` needs both `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY` from a
+  free **paper trading** account (email + MFA only — no ID verification or
+  funding needed since you're only reading market data, not trading). If
+  either is missing, the backend is silently skipped — `doctor` will flag
+  it. Framed in the extraction prompt as `[REAL-TIME NEWS WIRE]`.
+- `alphavantage` needs `ALPHA_VANTAGE_API_KEY` (free, alphavantage.co).
+  **The free tier is capped at 25 requests/day total on the account** —
+  not per ticker, not per backend, the whole key. Each `get_ticker_activity`
+  call (i.e. each company checked in a `research`/`sweep` run) costs exactly
+  one request regardless of how many articles come back. Prefers the
+  article's ticker-specific sentiment label over its overall label when
+  available, since a broad-market piece can be "Neutral" overall while
+  genuinely bullish or bearish for the one ticker you're tracking. Alpha
+  Vantage signals quota exhaustion with a 200 OK carrying an `Information`/
+  `Note` field instead of the normal article list — handled explicitly as a
+  soft-fail (`[]`), since it isn't an HTTP error status.
 - `stocktwits`'s public symbol-stream endpoint has historically required no
   API key for basic reads, but financial data APIs tend to tighten terms
   over time.
 
-All three fail soft (return no results, never raise) on a bad key, a
+All five fail soft (return no results, never raise) on a bad key, a
 rate-limit hit, or a network error — a broken financial-data backend should
 never take down a whole research run.
 
@@ -347,11 +376,11 @@ happen to find relationship-bearing claims.
 ## Scheduled monitoring (Phase 2)
 
 Every company on the watchlist can be checked automatically instead of only
-on demand. Two ways to run it — pick whichever fits how you already work:
+on demand. Three ways to run it — pick whichever fits how you already work.
 
-**Option A — `sweep`, driven by your OS's own scheduler (recommended).**
-No process to keep alive, and it plays nicely with free-tier API quotas that
-reset daily.
+**Option A — `sweep`, driven by your OS's own scheduler (recommended for
+swing/longer-horizon thesis tracking).** No process to keep alive, and it
+plays nicely with free-tier API quotas that reset daily.
 
 ```bash
 # Linux/Mac: crontab -e, then add a line like:
@@ -361,16 +390,50 @@ reset daily.
 #   Action: Program: python   Arguments: -m databroker.cli sweep   Start in: <project folder>
 ```
 
-**Option B — `watch-loop`, a long-running process** for anyone who'd rather
-leave a terminal or a small server running than configure an OS scheduler:
+**Option B — `watch-loop`, a long-running process, daily mode** for anyone
+who'd rather leave a terminal or a small server running than configure an OS
+scheduler:
 
 ```bash
 python -m databroker.cli watch-loop --at 08:00
 ```
 
 It sleeps until the next occurrence of that local time, sweeps the whole
-watchlist, prints the digest, and repeats — no extra dependency (`time`/
-`datetime` from the standard library only).
+watchlist, prints the digest, and repeats.
+
+**Option C — `watch-loop`, fast polling mode, for day trading.** Once a day
+is too slow if you're trading intraday — this sweeps every N minutes
+instead:
+
+```bash
+python -m databroker.cli watch-loop --interval-minutes 5
+```
+
+By default this only sweeps while the market is actually open (US equities
+regular hours, 9:30–16:00 America/New_York) — a closed-market tick is
+skipped with no API calls made at all, so free-tier LLM/search/financial
+quota isn't burned overnight or on weekends. Use `--market-tz` for a
+different market, or `--24-7` to poll around the clock regardless (useful
+for crypto tickers, which trade continuously):
+
+```bash
+python -m databroker.cli watch-loop --interval-minutes 5 --24-7        # ignore market hours
+python -m databroker.cli watch-loop --interval-minutes 5 --market-tz Europe/London
+```
+
+If you've also set `ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY` (the same
+credentials `FINANCIAL_BACKEND=alpaca` uses, reused here for a different
+purpose), the market-hours gate upgrades from a plain weekday+fixed-hours
+guess to Alpaca's actual trading calendar: it correctly treats real market
+holidays as closed, and uses each day's real close time rather than
+assuming 16:00 (e.g. early-close days like the day after Thanksgiving).
+Without those credentials, the gate falls back to the plain weekday+hours
+check, which is still fine — the only cost of the fallback is an occasional
+wasted sweep on a holiday, never a missed one on a real trading day.
+
+None of the three modes need an extra dependency beyond `tzdata` (for the
+market-hours timezone lookup — see `requirements.txt`; most Linux/Mac
+installs already have this via the OS).
 
 Both commands accept `--delay` (seconds paused between companies during a
 sweep, default 3) — a small courtesy delay for free-tier cloud APIs with a
@@ -403,7 +466,7 @@ Agent Orchestrator (agent.py: ResearchAgent)
    +--- Search Provider (search.py)   DuckDuckGo (default) | Tavily (optional) | Mock
    +--- Page Fetcher (fetcher.py)     static (default) | Browser Agent (browser.py, opt-in — §18)
    +--- Social Provider (social.py)   Reddit (OAuth pool via reddit_client.py, or public fallback) | Hacker News | off (default) — Phase 4, opt-in
-   +--- Financial Provider (social.py) SEC EDGAR | Finnhub | StockTwits | off (default) — "first line" ticker-scoped sources, opt-in, combinable
+   +--- Financial Provider (social.py) SEC EDGAR | Finnhub | Alpaca | Alpha Vantage | StockTwits | off (default) — "first line" ticker-scoped sources, opt-in, combinable
    |
 Scheduling (monitor.py)          sweep_once() / run_loop() — Phase 2, stdlib only
    |
@@ -471,7 +534,8 @@ python -m databroker.cli graph NVDA          # knowledge graph for one company
 python -m databroker.cli connections         # relationships across your whole watchlist
 python -m databroker.cli digest
 python -m databroker.cli sweep              # one-shot monitoring pass, see "Scheduled monitoring" below
-python -m databroker.cli watch-loop --at 08:00   # or run this as a long-lived process instead
+python -m databroker.cli watch-loop --at 08:00               # daily long-running loop
+python -m databroker.cli watch-loop --interval-minutes 5     # fast polling loop, for day trading
 ```
 
 Data persists in `~/.databroker/databroker.db` (SQLite) between runs.
@@ -489,14 +553,25 @@ missing functionality:
   not just normalized name) would handle the rare case of two different
   companies sharing a short common name.
 - **More financial platforms** — `social.py`'s `FinancialProvider` interface
-  now has three implementations (SEC EDGAR, Finnhub, StockTwits), combined
-  via `CombinedFinancialProvider`. Adding another (e.g. Alpha Vantage news,
-  a specific exchange's filing feed) is one more class plus one line in
-  `build_financial_from_env()` — the "first line" merging logic in
-  `agent.py`'s `investigate()` doesn't need to change, since it already
-  fetches once per session and merges whatever the provider(s) return, and
-  each provider can supply its own `context_label` for how the LLM should
-  treat that source type.
+  now has five implementations (SEC EDGAR, Finnhub, Alpaca, Alpha Vantage,
+  StockTwits), combined via `CombinedFinancialProvider`. Adding another
+  (e.g. Marketaux for broader international coverage, EDGAR full-text
+  search) is one more class plus one line in `build_financial_from_env()` —
+  the "first line" merging logic in `agent.py`'s `investigate()` doesn't
+  need to change, since it already fetches once per session and merges
+  whatever the provider(s) return, and each provider can supply its own
+  `context_label` for how the LLM should treat that source type. (Direct
+  Benzinga integration was considered and explicitly skipped — Benzinga's
+  own API is enterprise/paid, and the one free tier it offers, headline +
+  teaser only via AWS Marketplace, is strictly less than what `alpaca`
+  already provides for free, since Alpaca's feed is itself Benzinga-sourced.)
+- **Market-holiday awareness for fast polling** — done: `is_market_open()`
+  now consults Alpaca's `/v2/calendar` endpoint when Alpaca credentials are
+  available (per-date cached, falls back to the plain weekday+hours check
+  on any lookup failure or if credentials aren't set). Remaining gap: this
+  only covers US equities via Alpaca's calendar; a non-US market using
+  `--market-tz` still gets the plain heuristic, since Alpaca's calendar is
+  US-only.
 - **SEC full-text search** — the `sec` backend currently reads a company's
   own recent filings via the submissions endpoint. EDGAR's separate
   full-text search API (`efts.sec.gov`) indexes filing text across *all*

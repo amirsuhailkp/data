@@ -116,12 +116,26 @@ def build_parser():
 
     watch_loop = sub.add_parser(
         "watch-loop",
-        help="Run forever, sweeping the watchlist once a day at a fixed local time "
-             "(alternative to cron/Task Scheduler for a long-running process)",
+        help="Run forever, sweeping the watchlist (alternative to cron/Task Scheduler for a "
+             "long-running process). Default: once a day at a fixed local time. Pass "
+             "--interval-minutes for fast day-trading-style polling instead.",
     )
-    watch_loop.add_argument("--at", default="08:00", help="Local time to sweep, HH:MM (default 08:00)")
+    watch_loop.add_argument("--at", default="08:00",
+                             help="Local time for the daily sweep, HH:MM (default 08:00). "
+                                  "Ignored if --interval-minutes is set.")
     watch_loop.add_argument("--delay", type=float, default=3.0,
                              help="Seconds to pause between companies during each sweep")
+    watch_loop.add_argument("--interval-minutes", type=float, default=None,
+                             help="Switch to fast polling mode: sweep every N minutes instead "
+                                  "of once a day. For day trading, where a daily check is too "
+                                  "slow. Combine with --24-7 to also poll outside market hours.")
+    watch_loop.add_argument("--24-7", dest="around_the_clock", action="store_true",
+                             help="With --interval-minutes: keep polling even when the market "
+                                  "is closed (e.g. for crypto tickers). Default is to skip "
+                                  "closed-market ticks so free-tier quota isn't wasted overnight.")
+    watch_loop.add_argument("--market-tz", default="America/New_York",
+                             help="IANA timezone for the market-hours gate (default: America/New_York, "
+                                  "i.e. US equities). Ignored with --24-7.")
 
     return p
 
@@ -283,6 +297,26 @@ def cmd_doctor(db: DB, args):
     if "sec" in fin_names:
         print("  SEC EDGAR     =", f"contact set ({os.environ.get('SEC_EDGAR_CONTACT')})" if os.environ.get("SEC_EDGAR_CONTACT")
               else "no SEC_EDGAR_CONTACT set — works, but SEC's fair-access policy asks for a contact string in the User-Agent")
+    if "alpaca" in fin_names:
+        has_key = bool(os.environ.get("ALPACA_API_KEY_ID"))
+        has_secret = bool(os.environ.get("ALPACA_API_SECRET_KEY"))
+        if has_key and has_secret:
+            print("  Alpaca news   = credentials set")
+        else:
+            missing = [n for n, v in (("ALPACA_API_KEY_ID", has_key), ("ALPACA_API_SECRET_KEY", has_secret)) if not v]
+            print(f"  Alpaca news   = NOT configured — missing {', '.join(missing)} "
+                  "(free from a paper-trading account at alpaca.markets) — this source is skipped")
+    if "alphavantage" in fin_names:
+        if os.environ.get("ALPHA_VANTAGE_API_KEY"):
+            print("  Alpha Vantage = API key set — remember its free tier is capped at "
+                  "25 requests/day TOTAL on the account, shared across every ticker checked")
+        else:
+            print("  Alpha Vantage = NOT configured — set ALPHA_VANTAGE_API_KEY (free at "
+                  "alphavantage.co) or this source is skipped")
+    if os.environ.get("ALPACA_API_KEY_ID") and os.environ.get("ALPACA_API_SECRET_KEY"):
+        print("  watch-loop --interval-minutes will use these same Alpaca credentials for a "
+              "holiday-aware market-hours calendar (falls back to a plain weekday+hours check "
+              "without them).")
     print("FETCHER_BACKEND =", os.environ.get("FETCHER_BACKEND", "static (default)"))
     if os.environ.get("FETCHER_BACKEND", "static").lower() == "browser":
         try:
@@ -312,6 +346,7 @@ def cmd_sweep(db: DB, args):
 
 
 def cmd_watch_loop(db: DB, args):
+    import os
     from .monitor import run_loop
 
     try:
@@ -327,7 +362,18 @@ def cmd_watch_loop(db: DB, args):
               f"{summary.total_llm_calls} LLM call(s) total.")
         print(summary.digest)
 
-    run_loop(db, agent, at_hour=hour, at_minute=minute, delay_seconds=args.delay, on_sweep=on_sweep)
+    # Reuses the same Alpaca credentials as FINANCIAL_BACKEND=alpaca (if
+    # set) to make the market-hours gate holiday-aware; harmless/no-op if
+    # they're not configured — is_market_open() falls back to the plain
+    # weekday+hours check without them.
+    run_loop(
+        db, agent, at_hour=hour, at_minute=minute, delay_seconds=args.delay, on_sweep=on_sweep,
+        interval_minutes=args.interval_minutes,
+        market_hours_only=not args.around_the_clock,
+        market_tz=args.market_tz,
+        alpaca_api_key=os.environ.get("ALPACA_API_KEY_ID"),
+        alpaca_api_secret=os.environ.get("ALPACA_API_SECRET_KEY"),
+    )
 
 
 def main(argv=None):

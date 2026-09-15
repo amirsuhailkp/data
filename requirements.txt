@@ -19,8 +19,19 @@ python-dotenv>=1.0.0
 # also run: playwright install chromium
 # playwright>=1.45.0
 
+# tzdata — provides IANA timezone data for stdlib zoneinfo on platforms that
+# don't ship it themselves (notably Windows; Linux/Mac usually have it via
+# the OS already but installing is harmless). Needed for FINANCIAL_BACKEND
+# entries that check market hours, e.g. `watch-loop --interval-minutes`'s
+# market-hours gate.
+tzdata>=2024.1
+
 # --- Optional, only needed if you use these backends ---
 # Tavily search (optional upgrade over DuckDuckGo, needs a free API key): SEARCH_BACKEND=tavily
+#   (no extra package needed — called via `requests`)
+# Alpaca real-time news (free tier, needs a paper-trading account): FINANCIAL_BACKEND=alpaca
+#   (no extra package needed — called via `requests`)
+# Alpha Vantage news & sentiment (free tier, 25 req/day): FINANCIAL_BACKEND=alphavantage
 #   (no extra package needed — called via `requests`)
 # Google Gemini (free tier): LLM_BACKEND=gemini
 #   (no extra package needed — called via `requests`)
