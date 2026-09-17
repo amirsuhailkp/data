@@ -235,7 +235,7 @@ all five, or just `FINANCIAL_BACKEND=sec` for the free, no-key option on its own
 | `sec` | Official SEC EDGAR filings (8-K, 10-K, 10-Q, S-1, proxy statements, 13D/G, etc.) via `data.sec.gov` | Free, no API key | `filing`, tier **1** — the single highest-reliability source this tool has |
 | `finnhub` | Finnhub's company-news wire (`company-news` endpoint) | Free tier (~60 calls/min), needs `FINNHUB_API_KEY` from finnhub.io | `news`, tier 5 — same tier as general web news |
 | `alpaca` | Alpaca's Benzinga-sourced real-time news feed — pushed close to publication time, the fastest source here | Free, needs a paper-trading account (`ALPACA_API_KEY_ID`/`ALPACA_API_SECRET_KEY`) at alpaca.markets | `news`, tier 5 — same tier as Finnhub, just faster |
-| `alphavantage` | Alpha Vantage's NASDAQ-licensed news feed, with an AI sentiment score per article (overall AND per-ticker) | Free, needs `ALPHA_VANTAGE_API_KEY` — but capped at **25 requests/day total** on the account | `news`, tier 5 — differentiated by the sentiment label, not speed |
+| `alphavantage` | Alpha Vantage's NASDAQ-licensed news feed, with an AI sentiment score per article (overall AND per-ticker) | Free, needs `ALPHA_VANTAGE_API_KEY` — capped at **25 requests/day total**, so by default it's used as a **confirmation source**, not a polled one (see below) | `news`, tier 5 — used to corroborate, not to discover |
 | `stocktwits` | StockTwits' public symbol stream — real trader chatter/sentiment | Free, no key (historically) | `community`, tier 7 — sentiment/discussion, not verified fact |
 
 **If you're using this for day trading**, `alpaca` is the one to turn on —
@@ -291,6 +291,49 @@ with arbitrary text. That's reflected in how they're wired in (`social.py`'s
   either is missing, the backend is silently skipped — `doctor` will flag
   it. Framed in the extraction prompt as `[REAL-TIME NEWS WIRE]`.
 - `alphavantage` needs `ALPHA_VANTAGE_API_KEY` (free, alphavantage.co).
+
+### Alpha Vantage as a confirmation source (not a polled one)
+
+Alpha Vantage's free tier allows **25 requests/day total across the whole
+account** — not per ticker. Polled like the other sources under
+`watch-loop --interval-minutes 5`, that's exhausted in well under an hour,
+which is why it defaults to a different role instead: `ALPHA_VANTAGE_MODE=confirm`.
+
+In confirm mode it is never polled on a schedule. It fires **only** when
+some other source (SEC filings, Alpaca, Finnhub, StockTwits, Reddit) has
+already surfaced something that cleared the importance bar — at which point
+one call goes out to ask "does an independent source report this too?", and
+the answer is folded into the alert:
+
+```
+🔔 NVDA — What are the latest material developments?
+Regulators opened an antitrust investigation into NVIDIA.
+Importance: high | Thesis impact: challenges
+
+✅ Independently reported by the confirmation source:
+- Reuters: NVIDIA antitrust probe confirmed [AI sentiment for NVDA: Bearish]
+```
+
+or, when it can't corroborate:
+
+```
+⚠️ Not corroborated — the confirmation source returned no matching coverage
+(it may also be out of daily quota).
+```
+
+This is a deliberately cheap step: it makes **no LLM call**, and a "low"
+importance finding spends **zero** quota, because the check sits behind the
+same importance gate that decides whether to alert you at all. Spending one
+call per genuinely notable event keeps you inside 25/day comfortably while
+polling everything else around the clock — and turns the quota limit into a
+feature, since a second independent source confirming a headline is worth
+more than the same source being polled again.
+
+`ALPHA_VANTAGE_MODE=continuous` restores the old always-polled behavior
+(also requires `alphavantage` in `FINANCIAL_BACKEND`); only sensible if
+you've dropped back to once-daily sweeps. Setting both at once is prevented
+by design so the quota can't be spent twice. `doctor` reports which mode is
+active.
   **The free tier is capped at 25 requests/day total on the account** —
   not per ticker, not per backend, the whole key. Each `get_ticker_activity`
   call (i.e. each company checked in a `research`/`sweep` run) costs exactly
@@ -479,6 +522,256 @@ and its `last_swept_at` timestamp updated, so you always know how fresh the
 watchlist is (`python -m databroker.cli events <TICKER>` and the digest both
 reflect whatever the most recent sweep or manual `research` call found).
 
+## Alerts (push notifications, opt-in)
+
+By default the agent is pull-only — `sweep`/`watch-loop` update the DB and
+print/return a digest, but nothing reaches you unless you go look. Setting
+`NOTIFY_BACKEND=telegram` makes it push instead, in **two stages** per
+notable finding, as it's found — not batched to the end of a sweep:
+
+1. **Quick alert** — the moment a non-"low"-importance event is stored
+   (🚨 critical / 🔔 high / ℹ️ medium), a short ping goes out immediately:
+   ticker, what happened, importance, thesis impact. This is the fast path —
+   it doesn't wait for the fuller analysis below.
+2. **Analysis** — once that company's research session finishes, a second
+   message follows with the full report: overall assessment, strengths/
+   weaknesses, new risks, **upcoming catalysts** (concrete scheduled events
+   actually mentioned in the evidence — an earnings date, a hearing date, a
+   product launch — never a speculated one), and what to watch next.
+
+"Low" importance events stay quiet at both stages — that bar is what keeps
+this from paging you over routine noise. The underlying analyst persona
+understands common trading strategy frameworks (momentum/breakout, swing,
+mean-reversion, catalyst-driven) well enough to frame *why* something
+matters, but — same as everywhere else in this tool — it never turns that
+into a buy/sell recommendation or a price prediction; upcoming catalysts are
+reported as scheduled events to watch, not forecasts of what happens at them.
+
+Nothing is ever sent twice: the same importance/dedup logic that gates
+whether an event is stored at all is what gates whether it's alerted on.
+
+Setup, entirely inside Telegram, no server of your own needed:
+
+1. Message **@BotFather** → `/newbot` → follow the prompts → it gives you a
+   bot token (looks like `123456:ABC-...`).
+2. Open a chat with your new bot and send it any message (bots can't message
+   you first).
+3. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser — your
+   numeric chat id is under `message.chat.id` in the JSON it returns.
+
+```bash
+NOTIFY_BACKEND=telegram
+TELEGRAM_BOT_TOKEN=123456:ABC-...
+TELEGRAM_CHAT_ID=987654321
+```
+
+`python -m databroker.cli doctor` reports whether this is fully configured.
+If `NOTIFY_BACKEND=telegram` is set but the token/chat id are missing,
+sweeps still run normally — you just won't get alerts until they're filled in.
+
+## Zero-cost cloud deployment
+
+Everything above assumes a machine that's already on — your laptop, or a
+terminal you leave open. For alerts that actually reach you while you're
+away, the process needs to live somewhere that's always on, for free.
+
+**Oracle Cloud "Always Free" VM** is the best fit for `watch-loop
+--interval-minutes` specifically, because it's a real, persistent, free-
+forever server (not a trial) — the fast-polling loop just runs continuously,
+exactly like it would locally.
+
+1. Create a free-tier Ampere (ARM) instance at
+   [cloud.oracle.com](https://www.oracle.com/cloud/free/) — a card is needed
+   for identity verification, but the Always Free shapes are never billed.
+2. SSH in, then:
+   ```bash
+   sudo apt update && sudo apt install -y python3-venv git
+   git clone https://github.com/amirsuhailkp/data.git && cd data
+   python3 -m venv venv && source venv/bin/activate
+   pip install -r requirements.txt
+   cp .env.example .env    # fill in your LLM/financial/Telegram config
+   python -m databroker.cli add NVDA "NVIDIA Corporation"
+   python -m databroker.cli watch NVDA
+   ```
+3. Keep it running permanently with a systemd service instead of a terminal
+   session that dies on disconnect — create `/etc/systemd/system/databroker.service`:
+   ```ini
+   [Unit]
+   Description=DataBroker watch-loop
+   After=network.target
+
+   [Service]
+   Type=simple
+   User=ubuntu
+   WorkingDirectory=/home/ubuntu/data
+   EnvironmentFile=/home/ubuntu/data/.env
+   ExecStart=/home/ubuntu/data/venv/bin/python -m databroker.cli watch-loop --interval-minutes 5 --discover-every-hours 6
+   Restart=always
+   RestartSec=10
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   Then:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now databroker
+   journalctl -u databroker -f     # tail logs, including which model handled each step
+   ```
+
+**Alternative: GitHub Actions scheduled workflow** — free, and no VM to
+manage, but each run starts from a clean checkout (no persistent process),
+so the SQLite DB needs to be committed back to the repo between runs, and
+free-tier cron reliably supports intervals of ~15+ minutes rather than true
+continuous polling. A better fit for `sweep` on a daily/hourly cadence than
+for day-trading-speed `watch-loop` polling — ask if you want this wired up
+instead of or alongside the VM.
+
+## Chart & technical data
+
+Alongside news and filings, the agent can also watch the actual price chart
+for each watchlisted company — moving averages, RSI, recent volatility, and
+where price sits in its recent range — using real historical bars, not
+anything the LLM estimates.
+
+```bash
+TECHNICALS_BACKEND=alpaca
+```
+
+**This is computed, not asked.** SMA/RSI/volatility are plain arithmetic —
+computed in Python from Alpaca's free historical bars (same credentials as
+the news backend, no new signup), with **zero extra LLM calls**. Only the
+finished text summary is added to the report prompt:
+
+```
+Technical snapshot for NVDA (as of 2026-09-15, close $187.32):
+- Change vs prior close: +2.1%
+- 20-day SMA: $181.40 (price is above)
+- 50-day SMA: $175.10 (price is above)
+- RSI(14): 68.2
+- Recent daily volatility (stdev of returns, trailing window): 2.8%
+- Volume: 62,100,000 vs 38,400,000 20-day average (+62%)
+- 60-day range: $150.20 - $195.00 (price is at 92% of that range)
+```
+
+**The hard line, same as everywhere else here:** this data is fed to the
+LLM as *facts about past price action*, and it is explicitly instructed to
+use it only for framing (e.g. noting that a piece of news arrives while the
+stock sits near a notable technical level) — never to combine it with news
+to produce something that reads as a forecast, and never to predict a
+future price, direction, or magnitude of movement. "This earnings beat plus
+the breakout above resistance suggests further upside" is exactly the
+sentence this is built to prevent.
+
+**Cost discipline:** a technical snapshot alone, with no news to give it
+context, does **not** trigger an LLM call — it's shown as-is (it's free to
+compute) but the report LLM call still only fires when there's actual
+evidence to synthesize, same as before this feature existed. Skipped
+entirely (fails soft) for symbols with under 20 days of price history.
+
+## Market discovery — proposing NEW watchlist candidates
+
+Everything else in this tool is ticker-first: you name a company, it goes
+and looks. `discover` inverts that — it scans the market for unusual
+activity in symbols you are **not** already watching, and proposes them.
+
+```bash
+DISCOVER_BACKEND=alpaca,stocktwits
+```
+
+```bash
+python -m databroker.cli discover
+python -m databroker.cli discover --min-score 4 --limit 3   # stricter
+```
+
+Two free scanners, neither needing a new signup:
+
+| Scanner | What it flags | Cost |
+|---|---|---|
+| `alpaca` | Most-active names by volume, plus the day's top gainers and losers | Free — reuses your existing Alpaca paper-trading credentials |
+| `stocktwits` | Trending symbols (sudden retail chatter) | Free, no key |
+
+**How it stays cheap.** Raw scanner output is noisy — the top-volume list is
+mostly the same mega-caps every day. So a deterministic pass runs *before*
+any LLM call, scoring each symbol by how many **independent** signal types
+flagged it: a price move counts 3, unusual volume 2, trending chatter only 1
+(it's the easiest signal to manufacture). Only symbols clearing
+`--min-score` (default 3) are described to the LLM, and they're all
+described in **one** call. A market-wide scan therefore costs exactly one
+LLM call, or zero if nothing clears the bar. Symbols already on your
+watchlist are filtered out before scoring.
+
+Sample output:
+
+```
+🔍 Potential watchlist candidates — unusual market activity today:
+
+**ABCD** (corroboration score 6)
+  • among the day's most-traded names (50,000,000 shares)
+  • among the day's top gainers (+42.5% on the day)
+  • trending on StockTwits (AbcCorp)
+  Unrecognized small-cap; check for a filing or PR today.
+```
+
+If Telegram alerts are configured, the same list is pushed to you.
+
+**What this is and isn't.** A scanner hit means "something unusual is
+happening here" — which is equally consistent with a genuine opportunity, a
+pump, and a company in freefall. The LLM step is asked to characterize *why*
+a symbol might be showing this pattern and *what to check*, never whether to
+buy it; every output carries that caveat. Treat these as leads to research
+with `watch` + `research`, which is what the rest of the tool is for.
+
+## Testing your setup
+
+After filling in `.env` (or any time you change it), run:
+
+```bash
+python -m databroker.cli selftest
+```
+
+Unlike `doctor`, which only reports what's *configured*, `selftest` actually
+exercises each piece — a real LLM round-trip, a real search, a real query
+against each news source, a real market scan, and a real Telegram message to
+your phone — then tells you what genuinely works:
+
+```
+✅ LLM: freellmapi (Groq/Cerebras) responded with parseable JSON
+✅ Search: DuckDuckGoSearch returned 3 result(s)
+✅ Financial sources: 7 item(s) for AAPL
+⚠️  Confirmation source: not active (ALPHA_VANTAGE_MODE=confirm, key NOT set)
+✅ Discovery: Alpaca screener (most-actives + movers): 18 signal(s)
+✅ Alerts: Telegram bot -> chat 987654321 — test message sent, check your phone
+✅ Database: readable, 4 companies on the watchlist
+✅ Market-hours gate: market is OPEN right now (holiday-aware calendar)
+```
+
+`❌` means something is genuinely broken and worth fixing; `⚠️` usually just
+means an optional piece is switched off — check each one is off on purpose.
+Use `--ticker` to probe with a different symbol (default AAPL, chosen
+because it's liquid and well-covered, so "no results" means a real problem
+rather than a quiet stock).
+
+Note this spends one Alpha Vantage call if the confirmation source is
+active, out of your 25/day.
+
+## Full setup sequence
+
+```bash
+cp .env.example .env          # then fill it in
+python -m databroker.cli doctor        # what's configured?
+python -m databroker.cli selftest      # does it actually work?
+python -m databroker.cli add NVDA "NVIDIA Corporation"
+python -m databroker.cli watch NVDA
+python -m databroker.cli sweep --delay 0        # one monitoring pass
+python -m databroker.cli discover               # propose new candidates
+python -m databroker.cli watch-loop --interval-minutes 5 --discover-every-hours 6
+```
+
+That last command is the one to leave running (see the systemd unit in the
+deployment section): it polls your watchlist every 5 minutes and alerts you
+on anything notable, plus proposes new watchlist candidates every 6 hours.
+
 ## Architecture
 
 ```
@@ -570,7 +863,9 @@ python -m databroker.cli connections         # relationships across your whole w
 python -m databroker.cli digest
 python -m databroker.cli sweep              # one-shot monitoring pass, see "Scheduled monitoring" below
 python -m databroker.cli watch-loop --at 08:00               # daily long-running loop
+python -m databroker.cli discover                            # propose NEW watchlist candidates from market activity
 python -m databroker.cli watch-loop --interval-minutes 5     # fast polling loop, for day trading
+                                                               # (set NOTIFY_BACKEND=telegram for push alerts — see "Alerts" below)
 ```
 
 Data persists in `~/.databroker/databroker.db` (SQLite) between runs.

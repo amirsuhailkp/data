@@ -658,11 +658,14 @@ def build_financial_from_env() -> FinancialProvider | None:
     SEC_EDGAR_CONTACT set (a contact string SEC's fair-access policy asks
     for) but still runs without it. `alpaca` needs ALPACA_API_KEY_ID +
     ALPACA_API_SECRET_KEY (free from a paper-trading account, alpaca.markets)
-    and is silently skipped if either is missing. `alphavantage` needs
-    ALPHA_VANTAGE_API_KEY (free, alphavantage.co) and is silently skipped if
-    missing — note its free tier is capped at 25 requests/day TOTAL across
-    the whole account, so it's a poor fit combined with fast interval
-    polling; see README.
+    and is silently skipped if either is missing. `alphavantage` is a special
+    case: by default it is NOT polled here at all, because its free tier is
+    capped at 25 requests/day TOTAL across the whole account, which fast
+    interval polling would exhaust in minutes. Instead it's used as an
+    on-demand confirmation check (see build_confirmation_financial_from_env()
+    and agent.py's investigate()), fired only when another source already
+    found something notable. Set ALPHA_VANTAGE_MODE=continuous to opt back
+    into the old always-polled behavior; see README.
     """
     backend = os.environ.get("FINANCIAL_BACKEND", "off").lower()
     if backend in ("off", ""):
@@ -686,9 +689,42 @@ def build_financial_from_env() -> FinancialProvider | None:
                 providers.append(AlpacaNewsProvider(key_id, secret))
         elif name == "alphavantage":
             av_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
-            if av_key:
+            mode = os.environ.get("ALPHA_VANTAGE_MODE", "confirm").lower()
+            # "confirm" (the default) is handled separately by
+            # build_confirmation_financial_from_env() below — an on-demand check
+            # fired only when another source already found something notable,
+            # not polled every sweep tick. Only "continuous" re-adds it here as
+            # an always-polled source like the others. Listing it here AND
+            # leaving ALPHA_VANTAGE_MODE at its "confirm" default does nothing
+            # (by design, so the two modes can't silently double up calls).
+            if av_key and mode == "continuous":
                 providers.append(AlphaVantageNewsProvider(av_key))
 
     if not providers:
         return None
     return providers[0] if len(providers) == 1 else CombinedFinancialProvider(providers)
+
+
+def build_confirmation_financial_from_env() -> FinancialProvider | None:
+    """Alpha Vantage News & Sentiment used ONLY as an on-demand confirmation
+    check, not a continuously-polled source — see agent.py's investigate(),
+    which calls this at most once per notable event (something another
+    source already found and that cleared the importance bar), never once
+    per sweep tick. This is what lets it coexist with 24/7 fast polling
+    despite the free tier's 25-requests/day-total cap.
+
+    Env vars:
+      ALPHA_VANTAGE_API_KEY = free key from alphavantage.co
+      ALPHA_VANTAGE_MODE = confirm (default, if a key is set) | continuous | off
+
+    Set ALPHA_VANTAGE_MODE=continuous and add `alphavantage` to
+    FINANCIAL_BACKEND instead if you want the old always-polled behavior —
+    don't do both at once, or you'll spend the same quota twice.
+    """
+    av_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+    if not av_key:
+        return None
+    mode = os.environ.get("ALPHA_VANTAGE_MODE", "confirm").lower()
+    if mode != "confirm":
+        return None
+    return AlphaVantageNewsProvider(av_key)

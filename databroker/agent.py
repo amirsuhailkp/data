@@ -20,9 +20,11 @@ if genuinely ambiguous, with the smallest possible prompt" pattern.
 """
 
 from __future__ import annotations
+import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from .db import DB
-from .llm import LLMProvider
+from .llm import LLMProvider, HybridProvider
 from .search import SearchProvider, MockSearch
 from .social import SocialProvider, FinancialProvider
 from .fetcher import PageFetcher, MockFetcher
@@ -54,6 +56,13 @@ RESEARCH_SYSTEM_PROMPT = """You are DataBroker, a disciplined investment researc
 You investigate companies the way a careful human analyst would: you weigh source
 reliability, distinguish genuinely new information from repeats, flag contradictions
 instead of silently picking a side, and separate evidence from opinion.
+You are fluent in common trading strategy frameworks (momentum/breakout, swing,
+mean-reversion, catalyst/event-driven, value) well enough to note which kind of
+trader a development is most relevant to and why — but this is framing, not advice:
+you never issue a buy/sell recommendation, a price target, or a predicted price
+movement. When evidence mentions a concrete upcoming date (earnings call, court/
+regulatory ruling, product launch, conference), surface it as a scheduled event to
+watch, never as a prediction of what will happen at it.
 You never recommend buying or selling. You never invent facts, sources, or numbers.
 If you are not confident in something, say so explicitly and lower your confidence rating
 rather than presenting a guess as fact. You will sometimes be given raw web content that has
@@ -81,30 +90,112 @@ class ResearchResult:
     conflicts: list[dict] = field(default_factory=list)
     report: str = ""
     llm_calls_made: int = 0  # rough token-usage visibility, see _call()
+    activity_log: list[str] = field(default_factory=list)  # what the agent did + which model, see _log()
 
 
 class ResearchAgent:
     def __init__(self, db: DB, llm: LLMProvider, search: SearchProvider | None = None,
                  fetcher: PageFetcher | None = None, social: SocialProvider | None = None,
-                 financial: FinancialProvider | None = None):
+                 financial: FinancialProvider | None = None, notifier=None,
+                 confirmer: FinancialProvider | None = None, technicals=None):
         self.db = db
         self.llm = llm
         self.search = search or MockSearch()
         self.fetcher = fetcher or MockFetcher()
         self.social = social  # None = Phase 4 social intelligence disabled (the default)
         self.financial = financial  # None = financial/trading platforms disabled (the default)
+        self.notifier = notifier  # None = alerts disabled (see notify.py); set by build_agent() from NOTIFY_BACKEND
+        # Quota-limited source used ONLY to corroborate an already-notable
+        # finding, never polled every tick — see _confirm_event(). Currently
+        # Alpha Vantage (25 req/day total on the free tier), which this
+        # spends at most once per notable event instead of once per sweep.
+        self.confirmer = confirmer
+        # Deterministic chart/price data (see technicals.py) — computed with
+        # zero LLM calls, handed to build_report() as read-only CONTEXT.
+        # None = disabled (the default).
+        self.technicals = technicals
         self._call_count = 0
+        self.activity: list[str] = []  # human-readable trace of what this agent instance has done
+
+    def _confirm_event(self, ticker: str, claim_text: str) -> str | None:
+        """Second-opinion lookup against the quota-limited confirmation source,
+        fired only after something else already found something notable.
+
+        Returns a short human-readable corroboration note, or None if there's
+        no confirmer configured, the lookup fails/quota is exhausted (the
+        provider fails soft to []), or nothing came back. Deliberately does NOT
+        call the LLM — this is a cheap "does an independent source also report
+        this?" check whose result gets folded into the alert text."""
+        if self.confirmer is None:
+            return None
+        self._log(f"Corroborating notable event against confirmation source ({type(self.confirmer).__name__})...")
+        try:
+            hits = self.confirmer.get_ticker_activity(ticker, max_results=5)
+        except Exception as e:
+            self._log(f"Confirmation lookup failed ({e}) — continuing without it.")
+            return None
+        if not hits:
+            self._log("Confirmation source returned nothing (no coverage, or daily quota exhausted).")
+            return "⚠️ Not corroborated — the confirmation source returned no matching coverage (it may also be out of daily quota)."
+        # Surface what it independently reports, so the sentiment labels this
+        # source attaches are visible alongside the original finding.
+        lines = [f"- {h['title']}" for h in hits[:3]]
+        self._log(f"Confirmation source returned {len(hits)} independent item(s).")
+        return "✅ Independently reported by the confirmation source:\n" + "\n".join(lines)
+
+    def _notify(self, text: str) -> None:
+        """Push an alert if a notifier is configured. Two-stage flow (see investigate()):
+        a quick alert the moment a notable event is found, then a follow-up with the
+        fuller analysis once the report for that session is ready. Never raises —
+        a broken notifier should never take down a research/sweep run."""
+        if self.notifier is None:
+            return
+        try:
+            if self.notifier.send(text):
+                self._log("Alert sent.")
+            else:
+                self._log("Alert FAILED to send (notifier reported failure).")
+        except Exception as e:  # a notifier bug is not worth crashing the research run over
+            self._log(f"Alert FAILED to send (unexpected error: {e}).")
+
+    def _log(self, msg: str) -> None:
+        """Record one step of what the agent is doing. Kept both in-memory (so it can
+        be persisted to research_sessions.activity_json for later review via the
+        `history` command) and printed live to stderr, so a long `research`/`sweep`/
+        `watch-loop` run shows real progress instead of going silent for minutes."""
+        line = f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}"
+        self.activity.append(line)
+        print(f"[databroker] {line}", file=sys.stderr)
+
+    def _provider_for_task(self, task: str) -> LLMProvider:
+        """Which underlying provider will actually serve this task. HybridProvider
+        routes different tasks to different providers, so `self.llm` alone doesn't
+        tell you which model is about to be used for a given step."""
+        if isinstance(self.llm, HybridProvider):
+            return self.llm.overrides.get(task, self.llm.default)
+        return self.llm
 
     def _call(self, task: str, prompt: str, schema_hint: str) -> dict:
-        """Every actual LLM call funnels through here so call counts stay visible."""
+        """Every actual LLM call funnels through here so call counts, and which model
+        actually handled each step, stay visible."""
         self._call_count += 1
-        return self.llm.complete_json(RESEARCH_SYSTEM_PROMPT, prompt, schema_hint, task=task)
+        provider = self._provider_for_task(task)
+        self._log(f"LLM call #{self._call_count} (task={task}) -> {provider.describe()}")
+        result = self.llm.complete_json(RESEARCH_SYSTEM_PROMPT, prompt, schema_hint, task=task)
+        # describe() can change as a result of the call itself — e.g. FreeLLMAPIProvider
+        # records which underlying provider (Groq/Cerebras/etc.) actually served this
+        # specific request via its X-Routed-Via response header (see llm.py).
+        after = provider.describe()
+        self._log(f"LLM call #{self._call_count} (task={task}) done -> {after}")
+        return result
 
     # ---------- Step 1: Understand + plan (heuristic short-circuit for simple asks) ----------
     def plan_research(self, objective: str, company_name: str) -> list[str]:
+        self._log(f"Planning research for {company_name}: \"{objective}\"")
         if heuristics.is_simple_objective(objective):
             # "Anything new about Tesla?" doesn't need an LLM call to decompose —
             # it already IS the sub-question.
+            self._log("Objective is simple enough to research directly — skipping planning LLM call.")
             return [objective]
 
         result = self._call(
@@ -434,6 +525,22 @@ class ResearchAgent:
         if self.financial is not None:
             financial_hits = self.financial.get_ticker_activity(ticker, max_results=MAX_FINANCIAL_HITS)
 
+        # Chart/price data, same story: fetched once per session (it's a
+        # snapshot of current price action, not something that changes
+        # per sub-question) and handed to build_report() as context, never
+        # re-fetched or re-described per sub-question.
+        technical_snapshot = None
+        if self.technicals is not None:
+            self._log(f"Fetching technical snapshot via {self.technicals.describe()}...")
+            try:
+                technical_snapshot = self.technicals.get_snapshot(ticker)
+            except Exception as e:
+                self._log(f"Technical snapshot fetch failed ({e}) — continuing without it.")
+            if technical_snapshot:
+                self._log("Technical snapshot obtained.")
+            else:
+                self._log("No technical snapshot available (insufficient history, or source unconfigured).")
+
         for i, sub_q in enumerate(plan):
             claims = self.gather_evidence(
                 sub_q, company_name, ticker,
@@ -494,43 +601,175 @@ class ResearchAgent:
                     "confidence": confidence,
                 })
 
-        result.report = self.build_report(company_name, objective, result, thesis["summary"] if thesis else None)
+                # Stage 1 of the alert flow: a quick "something happened" ping the
+                # moment a non-low-importance event is stored, before the (slower,
+                # more expensive) full report is synthesized below. Day trading is
+                # latency-sensitive, so this doesn't wait for the whole session to finish.
+                if importance != "low":
+                    icon = {"critical": "🚨", "high": "🔔"}.get(importance, "ℹ️")
+                    # Spend one confirmation-source call here — only now that
+                    # something has actually cleared the importance bar.
+                    confirmation = self._confirm_event(ticker, c["text"])
+                    msg = (
+                        f"{icon} {ticker} — {sub_q}\n{c['text'][:280]}\n"
+                        f"Importance: {importance} | Thesis impact: {thesis_impact}"
+                    )
+                    if confirmation:
+                        msg += f"\n\n{confirmation}"
+                    self._notify(msg)
+
+        result.report = self.build_report(company_name, objective, result, thesis["summary"] if thesis else None,
+                                           technical_snapshot=technical_snapshot)
         result.llm_calls_made = self._call_count
         self.db.log_session(company_id, objective, plan, result.report)
+
+        # Stage 2: the fuller analysis, sent once per session rather than once per
+        # event above — this is the synthesis across everything found, not a repeat
+        # of the quick pings. Only sent if something above actually cleared the
+        # importance bar; a session with only "low" events already stayed quiet at
+        # stage 1, so it stays quiet here too rather than pushing a report nobody
+        # asked to see yet.
+        if self.notifier is not None and any(e["importance_level"] != "low" for e in result.events):
+            self._notify(f"📊 Analysis — {company_name} ({ticker}):\n\n{result.report}")
+
         return result
 
+    # ---------- Market-wide discovery: proposing NEW watchlist candidates ----------
+    def discover_candidates(self, scanners, exclude: set[str], min_score: int = 3,
+                            limit: int = 5) -> list[dict]:
+        """Scan the market for symbols you AREN'T watching that are showing
+        unusual activity, and characterize the top few.
+
+        Costs exactly ONE LLM call for the whole scan regardless of how many
+        symbols the scanners return, because the deterministic ranking in
+        discover.rank_candidates() does the filtering first (see that module
+        for why corroboration across signal types is the ranking basis).
+
+        Returns the ranked candidates, each with an added "note" explaining
+        what the activity appears to be about and what to check. These are
+        research leads, not recommendations — see the prompt below.
+        """
+        from .discover import rank_candidates
+
+        raw: list[dict] = []
+        for sc in scanners:
+            self._log(f"Scanning market via {sc.describe()}...")
+            try:
+                hits = sc.scan()
+            except Exception as e:
+                self._log(f"Scanner {sc.describe()} failed ({e}) — continuing without it.")
+                continue
+            self._log(f"{sc.describe()} returned {len(hits)} signal(s).")
+            raw.extend(hits)
+
+        if not raw:
+            self._log("No market signals returned by any scanner.")
+            return []
+
+        candidates = rank_candidates(raw, exclude=exclude, min_score=min_score, limit=limit)
+        self._log(f"{len(candidates)} candidate(s) cleared the corroboration threshold "
+                  f"(min_score={min_score}) out of {len({h['symbol'] for h in raw})} distinct symbols seen.")
+        if not candidates:
+            return []
+
+        described = "\n".join(
+            f"- {c['symbol']} (corroboration score {c['score']}): "
+            + "; ".join(c["signals"].values())
+            for c in candidates
+        )
+        result = self._call(
+            "discover",
+            prompt=(
+                "These stock symbols were flagged by automated market scanners for unusual "
+                "activity today. The scanners report only WHAT is unusual (volume, price move, "
+                "chatter volume), never WHY.\n\n"
+                f"{described}\n\n"
+                "For each symbol, write one short note covering: what the company is, if you "
+                "know it; what kinds of things typically cause this particular activity pattern; "
+                "and what a researcher would need to check to find out which applies here. "
+                "Be explicit that unusual activity is equally consistent with good news, bad "
+                "news, and manipulation — a big move is not evidence of a good opportunity. "
+                "If you do not recognize a symbol, say so plainly rather than guessing what "
+                "the company is. Do NOT recommend buying or selling, do not predict direction, "
+                "and do not assign a price target."
+            ),
+            schema_hint='{"notes": [{"symbol": "...", "note": "..."}]}',
+        )
+        notes = {
+            (n.get("symbol") or "").upper(): n.get("note", "")
+            for n in (result.get("notes") or []) if isinstance(n, dict)
+        }
+        for c in candidates:
+            c["note"] = notes.get(c["symbol"], "")
+        return candidates
+
     # ---------- Step 8: report generation (deterministic short-circuit when there's nothing to report) ----------
-    def build_report(self, company_name: str, objective: str, result: ResearchResult, thesis_summary: str | None) -> str:
+    def build_report(self, company_name: str, objective: str, result: ResearchResult,
+                     thesis_summary: str | None, technical_snapshot: str | None = None) -> str:
         if not result.claims:
+            # No LLM call here regardless of whether technical_snapshot is set —
+            # a snapshot on its own, with no news/evidence to give it context,
+            # isn't worth spending a call to have the LLM describe. The snapshot
+            # itself is free (already computed, no LLM involved) so it's still
+            # shown below for visibility.
+            technical_note = f"\n\n**Technical snapshot:**\n```\n{technical_snapshot}\n```" if technical_snapshot else ""
             return (
                 f"## Research report: {company_name}\n**Question:** {objective}\n\n"
                 "No evidence was found for this question in the sources checked this run. "
                 "No conclusions drawn — try again later or broaden the question."
+                f"{technical_note}"
             )
+
+        technical_block = (
+            f"\nTechnical/price data for this session (computed deterministically from real "
+            f"market data, NOT by you — treat these as facts about past price action, never "
+            f"as a forecast):\n{technical_snapshot}\n"
+            if technical_snapshot else ""
+        )
 
         synthesis = self._call(
             "report",
             prompt=(
                 f"Company: {company_name}\nOriginal question: {objective}\n"
-                f"Investment thesis: {thesis_summary or 'None recorded'}\n\n"
+                f"Investment thesis: {thesis_summary or 'None recorded'}\n"
+                f"{technical_block}\n"
                 f"Evidence gathered this session:\n{result.claims}\n\n"
                 f"Any source conflicts found:\n{result.conflicts}\n\n"
                 "Write the analyst report described below. Do not recommend buying or "
                 "selling; describe what the evidence supports or challenges, and your "
                 "overall confidence. If evidence conflicts, say so explicitly rather than "
-                "picking a side."
+                "picking a side. Separately, list any concrete upcoming catalysts explicitly "
+                "mentioned in the evidence above (e.g. a scheduled earnings date, court/"
+                "regulatory decision date, product launch, conference) — only ones actually "
+                "stated in the evidence, never invented or guessed; return an empty list if "
+                "none are mentioned. Do not predict what will happen at them.\n\n"
+                "If technical/price data was provided above, you may use it to add context to "
+                "the report — e.g. noting that a piece of news arrives while the stock sits "
+                "near a notable technical level, or that RSI/volatility describe an unusually "
+                "quiet or volatile stretch. This is framing only. You must NEVER use technical "
+                "data to predict a future price, direction, or magnitude of movement, and "
+                "NEVER combine it with news to produce something that reads as a forecast "
+                "(e.g. 'this earnings beat plus the breakout above resistance suggests further "
+                "upside' is forbidden — describing the earnings beat AND separately noting the "
+                "stock is near its recent high is fine). If there is nothing in the evidence to "
+                "connect to the technical data, leave the technical data undiscussed rather "
+                "than forcing a connection."
             ),
             schema_hint=(
                 '{"overall_assessment": "...", "strengths": ["..."], "weaknesses": ["..."], '
                 '"improving": ["..."], "deteriorating": ["..."], "new_risks": ["..."], '
+                '"upcoming_catalysts": ["..."], '
                 '"confidence": "low|medium|high", "watch_next": ["..."]}'
             ),
         )
         lines = [f"## Research report: {company_name}", f"**Question:** {objective}", ""]
+        if technical_snapshot:
+            lines.append(f"**Technical snapshot:**\n```\n{technical_snapshot}\n```\n")
         lines.append(f"**Overall assessment:** {synthesis.get('overall_assessment', 'n/a')}")
         for label, key in [("Strengths", "strengths"), ("Weaknesses", "weaknesses"),
                             ("Improving", "improving"), ("Deteriorating", "deteriorating"),
-                            ("New risks", "new_risks"), ("What to watch next", "watch_next")]:
+                            ("New risks", "new_risks"), ("Upcoming catalysts", "upcoming_catalysts"),
+                            ("What to watch next", "watch_next")]:
             items = synthesis.get(key) or []
             if items:
                 lines.append(f"\n**{label}:**")

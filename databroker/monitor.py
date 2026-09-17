@@ -226,7 +226,8 @@ def run_loop(db: DB, agent: ResearchAgent, at_hour: int = 8, at_minute: int = 0,
              market_open: tuple[int, int] = DEFAULT_MARKET_OPEN,
              market_close: tuple[int, int] = DEFAULT_MARKET_CLOSE,
              alpaca_api_key: str | None = None, alpaca_api_secret: str | None = None,
-             _sleep=time.sleep):
+             discover_every_hours: float | None = None, on_discover=None,
+             _sleep=time.sleep, _now=None):
     """Runs forever. Two modes:
 
     - `interval_minutes=None` (default): daily mode, one sweep at
@@ -243,17 +244,42 @@ def run_loop(db: DB, agent: ResearchAgent, at_hour: int = 8, at_minute: int = 0,
     lookup — see `is_market_open()`. Optional; the gate still works without
     them, just without holiday awareness.
 
+    `discover_every_hours`, if given, also runs market-wide discovery
+    (proposing NEW watchlist candidates — see discover.py) on its own, much
+    slower schedule via the `on_discover` callback. Deliberately decoupled
+    from the sweep interval: sweeps run every few minutes, but the market's
+    top movers don't meaningfully change that fast, so running discovery on
+    every tick would just re-alert you about the same symbols all day. It
+    fires on the first eligible tick and then at most once per
+    `discover_every_hours` after that.
+
     `on_sweep`, if given, is called with each SweepSummary (e.g. to print it
     or write it somewhere) — this function itself only prints loop-level
     status, so callers can stay fully headless via `on_sweep`.
 
-    `_sleep` is swappable for tests so this can be exercised without
+    `_sleep`/`_now` are swappable for tests so this can be exercised without
     actually waiting in wall-clock time.
     """
+    now_fn = _now or (lambda: datetime.datetime.now(datetime.timezone.utc))
+    last_discover_at = None
+
+    def _discovery_due() -> bool:
+        nonlocal last_discover_at
+        if discover_every_hours is None or on_discover is None:
+            return False
+        now = now_fn()
+        if last_discover_at is not None and \
+                (now - last_discover_at).total_seconds() < discover_every_hours * 3600:
+            return False
+        last_discover_at = now
+        return True
+
     if interval_minutes is not None:
         print(f"[databroker] Monitoring loop started. Fast polling every {interval_minutes:g} "
               f"minute(s){' (market hours only)' if market_hours_only else ' (24/7)'}. "
-              "Press Ctrl+C to stop.")
+              + (f"Market discovery every {discover_every_hours:g}h. "
+                 if discover_every_hours else "")
+              + "Press Ctrl+C to stop.")
         try:
             while True:
                 if market_hours_only and not is_market_open(
@@ -265,6 +291,13 @@ def run_loop(db: DB, agent: ResearchAgent, at_hour: int = 8, at_minute: int = 0,
                     summary = sweep_once(db, agent, delay_seconds=delay_seconds)
                     if on_sweep:
                         on_sweep(summary)
+                    # Discovery rides the same market-hours gate — scanning a
+                    # closed market just re-reads the last session's movers.
+                    if _discovery_due():
+                        try:
+                            on_discover()
+                        except Exception as e:
+                            print(f"[databroker] Discovery failed ({e}) — loop continues.")
                 _sleep(interval_minutes * 60)
         except KeyboardInterrupt:
             print("\n[databroker] Monitoring loop stopped.")
@@ -280,5 +313,10 @@ def run_loop(db: DB, agent: ResearchAgent, at_hour: int = 8, at_minute: int = 0,
             summary = sweep_once(db, agent, delay_seconds=delay_seconds)
             if on_sweep:
                 on_sweep(summary)
+            if _discovery_due():
+                try:
+                    on_discover()
+                except Exception as e:
+                    print(f"[databroker] Discovery failed ({e}) — loop continues.")
     except KeyboardInterrupt:
         print("\n[databroker] Monitoring loop stopped.")
