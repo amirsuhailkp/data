@@ -6,7 +6,7 @@ on:
     # free-tier load, runs can slip by several minutes past this. 15 min is
     # about the reliable floor; going tighter mostly just burns Actions
     # minutes waiting on a runner that doesn't show up any faster.
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 # Prevent overlapping runs from racing to commit/push the same DB file.
