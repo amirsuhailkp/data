@@ -1,0 +1,91 @@
+name: databroker sweep
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub's scheduler is best-effort, not exact — under
+    # free-tier load, runs can slip by several minutes past this. 15 min is
+    # about the reliable floor; going tighter mostly just burns Actions
+    # minutes waiting on a runner that doesn't show up any faster.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+# Prevent overlapping runs from racing to commit/push the same DB file.
+concurrency:
+  group: databroker-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # A GITHUB_TOKEN-authenticated checkout can push back to this same
+          # repo without any extra secret.
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run databroker sweep
+        env:
+          # --- LLM ---
+          # LLM_BACKEND repo variable: "groq" (simplest, one key) or
+          # "freellmapi" (pools multiple Groq/Cerebras/etc keys the same way
+          # your local Docker setup does — gh_run.sh starts a fresh
+          # freellmapi container each run and loads the keys below into it).
+          LLM_BACKEND: ${{ vars.LLM_BACKEND }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}   # optional; falls back to a sane default if unset
+
+          # --- Only used when LLM_BACKEND=freellmapi ---
+          FREELLMAPI_ENCRYPTION_KEY: ${{ secrets.FREELLMAPI_ENCRYPTION_KEY }}   # openssl rand -hex 32
+          FREELLMAPI_ADMIN_PASSWORD: ${{ secrets.FREELLMAPI_ADMIN_PASSWORD }}   # any 8+ char string
+          FREELLMAPI_PROVIDER_KEYS_JSON: ${{ secrets.FREELLMAPI_PROVIDER_KEYS_JSON }}   # see GITHUB_ACTIONS_SETUP.md
+          FREELLMAPI_MODEL: ${{ vars.FREELLMAPI_MODEL }}   # optional, e.g. auto:groq-cerebras
+
+          # --- Search ---
+          SEARCH_BACKEND: duckduckgo
+
+          # --- Social / financial sources (all optional — set the secrets
+          # for the ones you use; leaving a secret unset disables that
+          # source cleanly rather than erroring) ---
+          SOCIAL_BACKEND: ${{ vars.SOCIAL_BACKEND }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_SUBREDDITS: ${{ vars.REDDIT_SUBREDDITS }}
+
+          FINANCIAL_BACKEND: ${{ vars.FINANCIAL_BACKEND }}
+          SEC_EDGAR_CONTACT: ${{ vars.SEC_EDGAR_CONTACT }}
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          ALPHA_VANTAGE_MODE: ${{ vars.ALPHA_VANTAGE_MODE }}
+
+          TECHNICALS_BACKEND: ${{ vars.TECHNICALS_BACKEND }}
+
+          # --- Discovery (market-wide scan) ---
+          DISCOVER_BACKEND: ${{ vars.DISCOVER_BACKEND }}
+          DISCOVER_EVERY_N_RUNS: ${{ vars.DISCOVER_EVERY_N_RUNS }}  # e.g. 8 -> once per ~4h at a 30-min cadence
+
+          # --- Alerts ---
+          NOTIFY_BACKEND: telegram
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          FETCHER_BACKEND: static   # browser mode needs Playwright's browser binaries; skip on a runner
+        run: bash scripts/gh_run.sh

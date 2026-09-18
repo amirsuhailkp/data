@@ -14,6 +14,7 @@ Usage examples:
 from __future__ import annotations
 import argparse
 import sys
+from pathlib import Path
 from .db import DB
 from .llm import build_provider_from_env
 from .search import build_search_from_env
@@ -748,10 +749,12 @@ def cmd_watch_loop(db: DB, args):
 
 
 def main(argv=None):
+    import os
     _load_dotenv()
     parser = build_parser()
     args = parser.parse_args(argv)
-    db = DB()
+    db_path_override = os.environ.get("DATABROKER_DB_PATH")
+    db = DB(Path(db_path_override)) if db_path_override else DB()
     dispatch = {
         "add": cmd_add,
         "watch": cmd_watch,
