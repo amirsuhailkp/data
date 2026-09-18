@@ -43,19 +43,21 @@ jobs:
       - name: Run databroker sweep
         env:
           # --- LLM ---
-          # LLM_BACKEND repo variable: "groq" (simplest, one key) or
-          # "freellmapi" (pools multiple Groq/Cerebras/etc keys the same way
-          # your local Docker setup does — gh_run.sh starts a fresh
-          # freellmapi container each run and loads the keys below into it).
+          # LLM_BACKEND repo variable: "groq" (simplest, one key) or "pool"
+          # (pools multiple Groq + Cerebras keys directly in-process — no
+          # container, no external gateway — and walks the fixed model chain
+          # in databroker/llm.py's PooledProvider: openai/gpt-oss-120b (Groq)
+          # -> gpt-oss-120b (Cerebras) -> zai-glm-4.7 (Cerebras) ->
+          # qwen-3.8-27b (Cerebras)).
           LLM_BACKEND: ${{ vars.LLM_BACKEND }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL: ${{ vars.GROQ_MODEL }}   # optional; falls back to a sane default if unset
 
-          # --- Only used when LLM_BACKEND=freellmapi ---
-          FREELLMAPI_ENCRYPTION_KEY: ${{ secrets.FREELLMAPI_ENCRYPTION_KEY }}   # openssl rand -hex 32
-          FREELLMAPI_ADMIN_PASSWORD: ${{ secrets.FREELLMAPI_ADMIN_PASSWORD }}   # any 8+ char string
-          FREELLMAPI_PROVIDER_KEYS_JSON: ${{ secrets.FREELLMAPI_PROVIDER_KEYS_JSON }}   # see GITHUB_ACTIONS_SETUP.md
-          FREELLMAPI_MODEL: ${{ vars.FREELLMAPI_MODEL }}   # optional, e.g. auto:groq-cerebras
+          # --- Only used when LLM_BACKEND=pool ---
+          # Comma-separated lists — one key is fine, more keys = more pooled
+          # free-tier quota before the chain falls over to the next model.
+          GROQ_API_KEYS: ${{ secrets.GROQ_API_KEYS }}
+          CEREBRAS_API_KEYS: ${{ secrets.CEREBRAS_API_KEYS }}
 
           # --- Search ---
           SEARCH_BACKEND: duckduckgo

@@ -31,9 +31,8 @@ disables that source cleanly (see `doctor`'s output).
 | Secret | Used for |
 |---|---|
 | `GROQ_API_KEY` | LLM calls if using `LLM_BACKEND=groq` (simplest, one key) |
-| `FREELLMAPI_ENCRYPTION_KEY` | Only if using `LLM_BACKEND=freellmapi` — see step 2b |
-| `FREELLMAPI_ADMIN_PASSWORD` | Only if using `LLM_BACKEND=freellmapi` — see step 2b |
-| `FREELLMAPI_PROVIDER_KEYS_JSON` | Only if using `LLM_BACKEND=freellmapi` — see step 2b |
+| `GROQ_API_KEYS` | Only if using `LLM_BACKEND=pool` — see step 2b |
+| `CEREBRAS_API_KEYS` | Only if using `LLM_BACKEND=pool` — see step 2b |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Reddit social source |
 | `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` | Alpaca news/screener/technicals |
 | `FINNHUB_API_KEY` | Finnhub news/fundamentals |
@@ -45,56 +44,44 @@ outside your own machine** (chat logs, etc.) — treat any key that's left
 your local `.env` as potentially exposed and get a fresh one from that
 provider's dashboard first.
 
-### 2b. If you want freellmapi instead of plain Groq
+### 2b. If you want to pool multiple Groq + Cerebras keys instead of plain Groq
 
-You mentioned you already run freellmapi locally in Docker with multiple
-Groq and Cerebras keys pooled behind it. That local container isn't
-reachable from a GitHub Actions runner (it's on your home network), so
-`scripts/gh_run.sh` instead starts a **fresh freellmapi container inside
-the workflow itself** every run, and headlessly loads your provider keys
-into it via `scripts/gh_bootstrap_freellmapi.py` — no dashboard clicking
-needed. This was verified directly against freellmapi's own source
-(`POST /api/keys`, confirmed to accept `{platform, key, label}` and to
-support adding multiple keys for the same platform).
+This pools your keys **directly in databroker's own code** (`PooledProvider`
+in `databroker/llm.py`) — no separate gateway, no container, nothing extra
+to run. Each sweep tries a fixed chain of (provider, model) pairs, rotating
+through every key you give it for a provider before moving to the next
+entry in the chain:
 
-Set `LLM_BACKEND=freellmapi` as a repo **variable** (step 3), then add
-these three **secrets**:
+1. Groq — `openai/gpt-oss-120b`
+2. Cerebras — `gpt-oss-120b`
+3. Cerebras — `zai-glm-4.7`
+4. Cerebras — `qwen-3.8-27b`
 
-- **`FREELLMAPI_ENCRYPTION_KEY`** — any 64-char hex string. Generate one
-  with `openssl rand -hex 32`. This doesn't need to match your local
-  container's key; it's only used to encrypt keys inside this ephemeral
-  container for the few seconds it runs.
-- **`FREELLMAPI_ADMIN_PASSWORD`** — any password, 8+ characters. Used to
-  create the container's admin account each run; nothing you need to
-  remember or reuse elsewhere.
-- **`FREELLMAPI_PROVIDER_KEYS_JSON`** — a JSON array with every Groq and
-  Cerebras key you want pooled, e.g.:
-  ```json
-  [
-    {"platform": "groq", "key": "gsk_your_first_key", "label": "groq-1"},
-    {"platform": "groq", "key": "gsk_your_second_key", "label": "groq-2"},
-    {"platform": "cerebras", "key": "csk_your_key", "label": "cerebras-1"}
-  ]
+Set `LLM_BACKEND=pool` as a repo **variable** (step 3), then add these two
+**secrets** — each a comma-separated list of keys (one key is fine too):
+
+- **`GROQ_API_KEYS`** — one or more Groq keys, e.g.:
   ```
-  Paste this whole JSON blob as the secret's value (GitHub secrets support
-  multi-line values). Pull the actual key values from your local
-  freellmapi dashboard's Keys page, or straight from each provider's own
-  console if you still have them.
+  gsk_your_first_key,gsk_your_second_key
+  ```
+- **`CEREBRAS_API_KEYS`** — one or more Cerebras keys, e.g.:
+  ```
+  csk_your_first_key,csk_your_second_key
+  ```
 
-Each run: a brand-new freellmapi container starts, gets these keys loaded
-into it, serves the sweep, and is torn down when the job ends — so nothing
-persists between runs and there's no separate always-on freellmapi to
-maintain in the cloud. Optionally set `FREELLMAPI_MODEL` as a variable
-(e.g. `auto:groq-cerebras`) to match your local routing preference.
+Pull the actual key values from console.groq.com and cloud.cerebras.ai.
+No JSON, no admin password, no encryption key — just the raw comma-separated
+key lists. If you want a different model chain than the default above,
+set the optional variable `LLM_POOL_CHAIN` (step 3) instead of editing code.
 
 ## 3. Add repository variables (non-secret config)
 **Same page → Variables tab → New repository variable.**
 
 | Variable | Example value | Notes |
 |---|---|---|
-| `LLM_BACKEND` | `groq` or `freellmapi` | `groq` needs only `GROQ_API_KEY`; `freellmapi` needs the three secrets in step 2b |
+| `LLM_BACKEND` | `groq` or `pool` | `groq` needs only `GROQ_API_KEY`; `pool` needs the two secrets in step 2b |
 | `GROQ_MODEL` | (leave unset) | only if using `LLM_BACKEND=groq` and want to override the default |
-| `FREELLMAPI_MODEL` | `auto:groq-cerebras` | only if using `LLM_BACKEND=freellmapi` |
+| `LLM_POOL_CHAIN` | (leave unset) | only if using `LLM_BACKEND=pool` and want a different chain than the built-in default — comma-separated `provider:model` pairs, e.g. `groq:openai/gpt-oss-120b,cerebras:zai-glm-4.7` |
 | `SOCIAL_BACKEND` | `both` | or `reddit`, `stocktwits`, `off` |
 | `REDDIT_SUBREDDITS` | `daytrading,stocks,wallstreetbets` | |
 | `FINANCIAL_BACKEND` | `alpaca,sec,finnhub,stocktwits,alphavantage` | comma-separated, any subset |
@@ -138,11 +125,10 @@ The DB starts empty. Either:
   race, or Actions write permission not enabled per step 4), the job exits
   non-zero rather than silently reporting success, since a commit that
   never reached the remote would cause duplicate alerts on the next run.
-- **`LLM_BACKEND=freellmapi` adds ~10-20 seconds per run** for the
-  container to start and get bootstrapped, and a new failure surface: if
-  a run fails at the bootstrap step, check the job log for
-  `[gh_bootstrap]` lines first — a `401`/`409` there usually means the
-  admin password secret changed between runs (harmless, it just logs in
-  instead of signing up), while a `400` on a specific key means that
-  provider/key pair was rejected (check the platform name is exactly
-  `groq` or `cerebras`, lowercase, in `FREELLMAPI_PROVIDER_KEYS_JSON`).
+- **`LLM_BACKEND=pool` fails a model over per-key, not just per-model** —
+  if a run's LLM calls fail entirely, check the job log for a
+  `PooledProvider: every (provider, model, key) combination in the chain
+  failed` line; it lists exactly which provider/model/key attempts were
+  made and why each one failed (401 = bad/revoked key, 429 = that key is
+  rate-limited right now), which is normally enough to tell you whether to
+  rotate a key or just wait out a rate limit.

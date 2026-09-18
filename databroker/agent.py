@@ -182,9 +182,9 @@ class ResearchAgent:
         provider = self._provider_for_task(task)
         self._log(f"LLM call #{self._call_count} (task={task}) -> {provider.describe()}")
         result = self.llm.complete_json(RESEARCH_SYSTEM_PROMPT, prompt, schema_hint, task=task)
-        # describe() can change as a result of the call itself — e.g. FreeLLMAPIProvider
-        # records which underlying provider (Groq/Cerebras/etc.) actually served this
-        # specific request via its X-Routed-Via response header (see llm.py).
+        # describe() can change as a result of the call itself — e.g. PooledProvider
+        # records which underlying provider/model/key actually served this specific
+        # request (see llm.py).
         after = provider.describe()
         self._log(f"LLM call #{self._call_count} (task={task}) done -> {after}")
         return result
