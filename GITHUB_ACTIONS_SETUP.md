@@ -121,10 +121,20 @@ The DB starts empty. Either:
   the only "loop."
 - **Concurrency-guarded** — overlapping runs are prevented (`concurrency:`
   in the workflow) so two runs can't race to commit the same DB file.
-- **Push failures fail the job on purpose** — if `git push` fails (e.g. a
-  race, or Actions write permission not enabled per step 4), the job exits
-  non-zero rather than silently reporting success, since a commit that
-  never reached the remote would cause duplicate alerts on the next run.
+- **Syncs to `origin/main` before running, not just before pushing** — this
+  is what makes clicking "Re-run" on a completed job safe: a re-run
+  otherwise checks out the *original* commit the workflow started from, not
+  the current tip, so without this sync it would build on top of a commit
+  that's already been superseded and get its push rejected (`[rejected]
+  main -> main (fetch first)`). If you hit that error on an older version
+  of this script, pulling the latest `gh_run.sh` fixes it — just don't
+  re-run a job that already succeeded in the meantime.
+- **Push failures still fail the job on purpose** — the sync above makes
+  this rare (only a genuinely concurrent push landing in the few seconds
+  between the sync and this run's own push would trigger it), but when it
+  does happen the job exits non-zero rather than silently discarding the
+  commit, since a commit that never reached the remote would cause
+  duplicate alerts on the next run.
 - **`LLM_BACKEND=pool` fails a model over per-key, not just per-model** —
   if a run's LLM calls fail entirely, check the job log for a
   `PooledProvider: every (provider, model, key) combination in the chain

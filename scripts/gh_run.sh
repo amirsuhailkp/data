@@ -15,6 +15,21 @@ cd "$(dirname "$0")/.."
 export DATABROKER_DB_PATH="${DATABROKER_DB_PATH:-$(pwd)/data/databroker.db}"
 mkdir -p "$(dirname "$DATABROKER_DB_PATH")"
 
+# Sync to whatever's actually on origin/<branch> right now, before touching
+# the DB. This matters most for a *re-run*: GitHub Actions checks out a
+# re-run at the same commit the workflow originally started from, not the
+# current tip — so if the original run already committed+pushed a DB
+# update, a naive re-run would build its own commit on top of the old
+# (now-superseded) commit and get its push rejected. Syncing first means
+# the sweep always starts from the real current state, so the commit this
+# run produces is a normal fast-forward on top of it. (SQLite is a binary
+# format git can't meaningfully 3-way-merge, so avoiding the divergence
+# here beats trying to resolve a conflict after the fact.)
+BRANCH="$(git branch --show-current)"
+git fetch origin "$BRANCH" -q
+git reset --hard "origin/$BRANCH" -q
+echo "[gh_run] Synced to origin/$BRANCH ($(git rev-parse --short HEAD)) before running."
+
 echo "[gh_run] DB path: $DATABROKER_DB_PATH"
 echo "[gh_run] Running sweep..."
 python -m databroker.cli sweep --delay "${SWEEP_DELAY:-1}"
@@ -61,7 +76,14 @@ else
         exit 1
     fi
     if ! git push; then
-        echo "[gh_run] git push failed — DB changes are committed locally but not on the remote." >&2
+        # Should be rare now that we sync to origin before running (see
+        # above) — this means something else pushed to $BRANCH in the
+        # narrow window between that sync and this push, i.e. a genuine
+        # concurrent run rather than a stale re-run. Failing loudly here is
+        # deliberate: silently discarding this commit could mean an alert
+        # already sent this run (see notify step) never gets its
+        # corresponding DB row persisted, causing a duplicate alert next run.
+        echo "[gh_run] git push failed even though we synced to origin/$BRANCH at the start of this run — something else pushed to $BRANCH in between. DB changes are committed locally but not on the remote. Don't re-run this job (that replays this same stale commit) — just let the next scheduled run go, or trigger a fresh workflow_dispatch run." >&2
         exit 1
     fi
     echo "[gh_run] Committed and pushed DB changes."
